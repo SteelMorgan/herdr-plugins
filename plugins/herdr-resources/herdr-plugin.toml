@@ -1,0 +1,24 @@
+id = "herdr.resources"
+name = "Herdr Resources"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Live CPU, memory, disk and Herdr Mirror status for configured dev-containers."
+platforms = ["linux"]
+
+[[panes]]
+id = "dashboard"
+title = "Container resources"
+placement = "split"
+command = ["/bin/sh", "-c", "exec /usr/bin/python3 \"$HERDR_PLUGIN_ROOT/bin/dashboard.py\""]
+
+[[actions]]
+id = "open"
+title = "Resources: open container dashboard"
+description = "Open or focus the live dev-container resource dashboard."
+command = ["/bin/sh", "bin/open-dashboard.sh"]
+
+[[actions]]
+id = "diagnose"
+title = "Resources: diagnose collectors"
+description = "Print resolved mirror hosts, containers and collector status."
+command = ["/bin/sh", "-c", "exec /usr/bin/python3 \"$HERDR_PLUGIN_ROOT/bin/dashboard.py\" --diagnose"]

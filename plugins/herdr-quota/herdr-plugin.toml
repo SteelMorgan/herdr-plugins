@@ -1,0 +1,36 @@
+id = "herdr.quota"
+name = "Herdr Quota"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Live subscription limits for Codex, Claude and Kimi plus DeepSeek API balance."
+platforms = ["linux", "macos"]
+
+[[panes]]
+id = "dashboard"
+title = "LLM Usage"
+placement = "split"
+command = ["/bin/sh", "-c", "exec /usr/bin/python3 \"$HERDR_PLUGIN_ROOT/bin/dashboard.py\""]
+
+[[panes]]
+id = "deepseek-config"
+title = "DeepSeek · secure setup"
+placement = "popup"
+command = ["/bin/sh", "-c", "exec /usr/bin/python3 \"$HERDR_PLUGIN_ROOT/bin/configure_deepseek.py\""]
+
+[[actions]]
+id = "open"
+title = "Quota: open live dashboard"
+description = "Open or focus the model quota dashboard on the right."
+command = ["/bin/sh", "bin/open-dashboard.sh"]
+
+[[actions]]
+id = "diagnose"
+title = "Quota: diagnose providers"
+description = "Check CLI availability, authentication surfaces, and DeepSeek configuration."
+command = ["/bin/sh", "-c", "exec /usr/bin/python3 \"$HERDR_PLUGIN_ROOT/bin/dashboard.py\" --diagnose"]
+
+[[actions]]
+id = "configure-deepseek"
+title = "Quota: configure DeepSeek securely"
+description = "Enter a DeepSeek key in a masked popup, validate it, and save it with mode 0600."
+command = ["/bin/sh", "bin/open-deepseek-config.sh"]
