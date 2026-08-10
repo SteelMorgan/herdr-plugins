@@ -20,9 +20,10 @@ import tty
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 ESC = "\x1b["
@@ -216,44 +217,97 @@ def iso_epoch(value: str | None) -> int | None:
 
 
 def claude_collect() -> Provider:
-    """Read the same OAuth utilization resource used by Claude Code itself."""
-    provider = Provider("CLAUDE")
-    credentials_path = Path.home() / ".claude" / ".credentials.json"
-    try:
-        oauth = json.loads(credentials_path.read_text(encoding="utf-8"))["claudeAiOauth"]
-        token = oauth["accessToken"]
-        provider.plan = str(oauth.get("subscriptionType") or "subscription")
-    except (FileNotFoundError, KeyError, json.JSONDecodeError) as exc:
-        provider.status, provider.error = "unavailable", "Claude OAuth login not found"
-        return provider
-    request = urllib.request.Request(
-        "https://api.anthropic.com/api/oauth/usage",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "anthropic-beta": "oauth-2025-04-20",
-            "User-Agent": "herdr-quota/0.1.0",
-        },
+    """Use Claude Code's supported interactive /usage command."""
+    return usage_cli_collect("CLAUDE", "claude")
+
+
+def parse_claude_reset(line: str, now: datetime | None = None) -> int | None:
+    """Convert Claude's absolute `Resets ...` text to a local epoch."""
+    match = re.search(
+        r"(?i)\bresets?\s*"
+        r"(?:(?P<month>[a-z]{3,9})\s*(?P<day>\d{1,2})\s*,\s*)?"
+        r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>[ap]m)"
+        r"(?:\s*\((?P<timezone>[^)]+)\))?",
+        line,
     )
-    try:
-        with urllib.request.urlopen(request, timeout=12) as response:
-            payload = json.load(response)
-        for key, label, duration in (("five_hour", "5 hour", 300), ("seven_day", "weekly", 10080)):
-            window = payload.get(key)
-            if not isinstance(window, dict):
-                continue
-            used = float(window.get("utilization") or 0)
-            provider.windows.append(Window(label, max(0, min(100, round(used))), iso_epoch(window.get("resets_at")), duration))
-        extra = payload.get("extra_usage")
-        if isinstance(extra, dict) and extra.get("is_enabled"):
-            provider.details.append(f"extra usage {extra.get('used_credits', 0)} / {extra.get('monthly_limit', '?')} {extra.get('currency', '')}".strip())
-        provider.status = "ok" if provider.windows else "empty"
-    except urllib.error.HTTPError as exc:
-        provider.status = "auth" if exc.code in (401, 403) else "error"
-        provider.error = "Claude login needs refresh" if provider.status == "auth" else f"HTTP {exc.code}"
-    except Exception as exc:
-        provider.status, provider.error = "error", str(exc)
-    return provider
+    if not match:
+        return None
+
+    timezone_name = match.group("timezone")
+    timezone = datetime.now().astimezone().tzinfo
+    if timezone_name:
+        try:
+            timezone = ZoneInfo(timezone_name.strip())
+        except ZoneInfoNotFoundError:
+            pass
+    if timezone is None:
+        return None
+    current = (now or datetime.now().astimezone()).astimezone(timezone)
+
+    hour = int(match.group("hour")) % 12
+    if match.group("ampm").lower() == "pm":
+        hour += 12
+    minute = int(match.group("minute") or 0)
+    month_text = match.group("month")
+    day_text = match.group("day")
+    if month_text and day_text:
+        months = {name.lower(): number for number, name in enumerate(
+            ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"),
+            start=1,
+        )}
+        month = months.get(month_text[:3].lower())
+        if month is None:
+            return None
+        year = current.year
+        candidate = datetime(year, month, int(day_text), hour, minute, tzinfo=timezone)
+        if candidate <= current:
+            candidate = candidate.replace(year=year + 1)
+    else:
+        candidate = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate <= current:
+            candidate += timedelta(days=1)
+    return int(candidate.timestamp())
+
+
+def parse_claude_usage(text: str) -> tuple[str, list[Window]]:
+    """Parse account-wide windows from Claude Code's interactive /usage screen."""
+    lines = text.splitlines()
+    plan = ""
+    windows: list[Window] = []
+
+    for line in lines:
+        match = re.search(r"(?i)Claude\s*(Max|Pro|Team|Enterprise)", line)
+        if match:
+            plan = match.group(1).lower()
+            break
+
+    for index, line in enumerate(lines):
+        compact = re.sub(r"\s+", "", line).lower()
+        if compact not in ("currentsession", "currentweek(allmodels)"):
+            continue
+        label = "5 hour" if compact == "currentsession" else "weekly"
+        duration = 300 if label == "5 hour" else 10080
+        used: int | None = None
+        resets_at: int | None = None
+        reset_text = ""
+        for following in lines[index + 1 : index + 6]:
+            percent = re.search(r"(?i)\b(\d{1,3})\s*%\s*(used|remaining|left)?", following)
+            if percent and used is None:
+                value = min(100, int(percent.group(1)))
+                sense = (percent.group(2) or "used").lower()
+                used = 100 - value if sense in ("remaining", "left") else value
+            reset = re.search(r"(?i)resets?\s+in\s+(.+)", following)
+            if reset:
+                reset_text = reset.group(1).strip()
+            absolute_reset = parse_claude_reset(following)
+            if absolute_reset is not None:
+                resets_at = absolute_reset
+            if used is not None and (resets_at is not None or reset_text):
+                break
+        if used is not None:
+            windows.append(Window(label, used, resets_at=resets_at, duration_minutes=duration, reset_text=reset_text))
+
+    return plan, windows
 
 
 def usage_cli_collect(name: str, command: str, startup_wait: float = 5.0) -> Provider:
@@ -288,6 +342,12 @@ def usage_cli_collect(name: str, command: str, startup_wait: float = 5.0) -> Pro
             elif time.monotonic() >= minimum_wait and time.monotonic() - quiet_since > 2.0:
                 break
         text = clean_terminal(output.decode("utf-8", "replace"))
+        if name == "CLAUDE":
+            provider.plan, provider.windows = parse_claude_usage(text)
+            provider.status = "ok" if provider.windows else "unsupported"
+            if provider.status == "unsupported":
+                provider.error = "/usage returned no parseable quota"
+            return provider
         relevant = []
         for line in text.splitlines():
             low = line.lower()
