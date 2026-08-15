@@ -39,6 +39,14 @@ MAUVE = f"{ESC}38;2;203;166;247m"
 BLUE = f"{ESC}38;2;137;180;250m"
 ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 
+AUTO_REFRESH_SECONDS = 300
+CODEX_ATTEMPT_TIMEOUT_SECONDS = 5
+USAGE_RESPONSE_TIMEOUT_SECONDS = 15
+USAGE_PARSED_QUIET_SECONDS = 1.0
+TRANSIENT_RETRY_DELAYS_SECONDS = (0.5, 1.5)
+COLLECTOR_STAGGER_SECONDS = 1.5
+COLLECTOR_JOIN_TIMEOUT_SECONDS = 70
+
 
 @dataclass
 class Window:
@@ -66,8 +74,23 @@ class Store:
         self.items = {name: Provider(name) for name in ("CODEX", "CLAUDE", "KIMI", "DEEPSEEK API")}
 
     def put(self, provider: Provider) -> None:
-        provider.updated_at = time.time()
+        now = time.time()
         with self.lock:
+            previous = self.items[provider.name]
+            if provider.status in ("ok", "depleted"):
+                provider.updated_at = now
+            elif provider.status in ("error", "unsupported") and previous.updated_at and previous.status in ("ok", "depleted", "stale"):
+                provider = Provider(
+                    provider.name,
+                    status="stale",
+                    plan=previous.plan,
+                    windows=list(previous.windows),
+                    details=list(previous.details),
+                    error=provider.error or provider.status,
+                    updated_at=previous.updated_at,
+                )
+            else:
+                provider.updated_at = now
             self.items[provider.name] = provider
 
     def snapshot(self) -> list[Provider]:
@@ -89,6 +112,40 @@ def find_binary(command: str) -> str | None:
         Path.home() / ".kimi-code" / "bin" / command,
     )
     return next((str(path) for path in candidates if path.is_file() and os.access(path, os.X_OK)), None)
+
+
+def is_transient_error(provider: Provider) -> bool:
+    if provider.status != "error":
+        return False
+    error = provider.error.lower()
+    http_status = re.search(r"\bhttp\s+(\d{3})\b", error)
+    if http_status:
+        code = int(http_status.group(1))
+        return code == 429 or code >= 500
+    return any(marker in error for marker in (
+        "ssl", "tls", "eof", "timeout", "timed out", "connection",
+        "network", "error sending request", "temporarily unavailable",
+        "reset by peer", "name resolution", "temporary failure",
+    ))
+
+
+def collect_with_retry(collector: Any) -> Provider:
+    provider = collector()
+    for delay in TRANSIENT_RETRY_DELAYS_SECONDS:
+        if not is_transient_error(provider):
+            break
+        time.sleep(delay)
+        provider = collector()
+    return provider
+
+
+def format_age(updated_at: float) -> str:
+    seconds = max(0, int(time.time() - updated_at))
+    if seconds < 60:
+        return "<1m"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    return format_countdown(seconds, compact=True)
 
 
 def format_countdown(seconds: int | None, compact: bool = False) -> str:
@@ -138,12 +195,8 @@ def format_burn(window: Window) -> str:
     return f"x{rate:.1f}"
 
 
-def codex_collect() -> Provider:
+def _codex_collect_once(binary: str) -> Provider:
     provider = Provider("CODEX")
-    binary = find_binary("codex")
-    if not binary:
-        provider.status, provider.error = "unavailable", "codex not found"
-        return provider
     proc = subprocess.Popen(
         [binary, "app-server", "--stdio"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL, text=True, bufsize=1,
@@ -158,7 +211,7 @@ def codex_collect() -> Provider:
         for message in messages:
             proc.stdin.write(json.dumps(message) + "\n")
         proc.stdin.flush()
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + CODEX_ATTEMPT_TIMEOUT_SECONDS
         payload: dict[str, Any] | None = None
         while time.monotonic() < deadline:
             ready, _, _ = select.select([proc.stdout], [], [], 0.5)
@@ -205,6 +258,13 @@ def codex_collect() -> Provider:
         except subprocess.TimeoutExpired:
             proc.kill()
     return provider
+
+
+def codex_collect() -> Provider:
+    binary = find_binary("codex")
+    if not binary:
+        return Provider("CODEX", status="unavailable", error="codex not found")
+    return collect_with_retry(lambda: _codex_collect_once(binary))
 
 
 def iso_epoch(value: str | None) -> int | None:
@@ -310,12 +370,47 @@ def parse_claude_usage(text: str) -> tuple[str, list[Window]]:
     return plan, windows
 
 
-def usage_cli_collect(name: str, command: str, startup_wait: float = 5.0) -> Provider:
+def parse_usage_text(name: str, text: str) -> Provider:
     provider = Provider(name)
-    binary = find_binary(command)
-    if not binary:
-        provider.status, provider.error = "unavailable", f"{command} not found"
-        return provider
+    if name == "CLAUDE":
+        provider.plan, provider.windows = parse_claude_usage(text)
+    else:
+        relevant = []
+        for line in text.splitlines():
+            low = line.lower()
+            if any(word in low for word in ("usage", "remaining", "reset", "limit", "plan", "quota", "%", "week", "hour")):
+                if line not in relevant and len(line) < 180:
+                    relevant.append(line)
+        # Both supported subscription CLIs describe consumption as "% used".
+        # Parse only explicit limit rows; percentages elsewhere in a startup
+        # screen are commonly context meters and must not become account quota.
+        for line in relevant:
+            match = re.search(r"(?i)\b(weekly|week|5h)\s+limit[^\n%]*?(\d{1,3})\s*%\s*(used|remaining|left)?", line)
+            if not match:
+                continue
+            label_raw, value_raw, sense = match.groups()
+            value = min(100, int(value_raw))
+            used = 100 - value if sense and sense.lower() in ("remaining", "left") else value
+            label = "weekly" if label_raw.lower() in ("weekly", "week") else "5 hour"
+            reset_match = re.search(r"(?i)resets?\s+in\s+([^│]+)", line)
+            reset_text = reset_match.group(1).strip() if reset_match else ""
+            duration = 10080 if label == "weekly" else (300 if label == "5 hour" else None)
+            provider.windows.append(Window(label, used, duration_minutes=duration, reset_text=reset_text))
+    provider.status = "ok" if provider.windows else "unsupported"
+    if provider.status == "unsupported":
+        provider.error = "/usage returned no parseable quota"
+    return provider
+
+
+def has_usage_screen(name: str, text: str) -> bool:
+    compact = re.sub(r"\s+", " ", text).lower()
+    if name == "CLAUDE":
+        return "current session" in compact or "current week (all models)" in compact
+    return "plan usage" in compact or "weekly limit" in compact or "5h limit" in compact
+
+
+def _usage_cli_collect_once(name: str, binary: str, startup_wait: float) -> Provider:
+    provider = Provider(name)
     pid, fd = pty.fork()
     if pid == 0:
         os.environ.setdefault("TERM", "xterm-256color")
@@ -329,8 +424,8 @@ def usage_cli_collect(name: str, command: str, startup_wait: float = 5.0) -> Pro
                 output.extend(os.read(fd, 65536))
         os.write(fd, b"/usage\r")
         quiet_since = time.monotonic()
-        minimum_wait = time.monotonic() + 5
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + USAGE_RESPONSE_TIMEOUT_SECONDS
+        parsed = Provider(name)
         while time.monotonic() < deadline:
             ready, _, _ = select.select([fd], [], [], 0.35)
             if ready:
@@ -339,40 +434,15 @@ def usage_cli_collect(name: str, command: str, startup_wait: float = 5.0) -> Pro
                     break
                 output.extend(chunk)
                 quiet_since = time.monotonic()
-            elif time.monotonic() >= minimum_wait and time.monotonic() - quiet_since > 2.0:
+                text = clean_terminal(output.decode("utf-8", "replace"))
+                parsed = parse_usage_text(name, text)
+            elif parsed.status == "ok" and time.monotonic() - quiet_since > USAGE_PARSED_QUIET_SECONDS:
                 break
         text = clean_terminal(output.decode("utf-8", "replace"))
-        if name == "CLAUDE":
-            provider.plan, provider.windows = parse_claude_usage(text)
-            provider.status = "ok" if provider.windows else "unsupported"
-            if provider.status == "unsupported":
-                provider.error = "/usage returned no parseable quota"
-            return provider
-        relevant = []
-        for line in text.splitlines():
-            low = line.lower()
-            if any(word in low for word in ("usage", "remaining", "reset", "limit", "plan", "quota", "%", "week", "hour")):
-                if line not in relevant and len(line) < 180:
-                    relevant.append(line)
-        # Both supported subscription CLIs describe consumption as "% used".
-        # Parse only explicit limit rows; percentages elsewhere in a startup
-        # screen are commonly context meters and must not become account quota.
-        for line in relevant:
-            match = re.search(r"(?i)\b(weekly|week|5h|session)[^\n%]*?(\d{1,3})\s*%\s*(used|remaining|left)?", line)
-            if not match:
-                continue
-            label_raw, value_raw, sense = match.groups()
-            value = min(100, int(value_raw))
-            used = 100 - value if sense and sense.lower() in ("remaining", "left") else value
-            label = "weekly" if label_raw.lower() in ("weekly", "week") else ("5 hour" if label_raw.lower() == "5h" else "session")
-            reset_match = re.search(r"(?i)resets?\s+in\s+([^│]+)", line)
-            reset_text = reset_match.group(1).strip() if reset_match else ""
-            duration = 10080 if label == "weekly" else (300 if label == "5 hour" else None)
-            provider.windows.append(Window(label, used, duration_minutes=duration, reset_text=reset_text))
-        provider.status = "ok" if provider.windows else "unsupported"
-        if provider.status == "unsupported":
-            provider.details = []
-            provider.error = "/usage returned no parseable quota"
+        provider = parse_usage_text(name, text)
+        if provider.status == "unsupported" and not has_usage_screen(name, text):
+            provider.status = "error"
+            provider.error = "/usage response timed out before quota became parseable"
     except Exception as exc:
         provider.status, provider.error = "error", str(exc)
     finally:
@@ -395,6 +465,13 @@ def usage_cli_collect(name: str, command: str, startup_wait: float = 5.0) -> Pro
     return provider
 
 
+def usage_cli_collect(name: str, command: str, startup_wait: float = 5.0) -> Provider:
+    binary = find_binary(command)
+    if not binary:
+        return Provider(name, status="unavailable", error=f"{command} not found")
+    return collect_with_retry(lambda: _usage_cli_collect_once(name, binary, startup_wait))
+
+
 def load_plugin_env() -> dict[str, str]:
     values: dict[str, str] = {}
     config_dir = os.environ.get("HERDR_PLUGIN_CONFIG_DIR")
@@ -413,12 +490,8 @@ def load_plugin_env() -> dict[str, str]:
     return values
 
 
-def deepseek_collect() -> Provider:
+def _deepseek_collect_once(token: str) -> Provider:
     provider = Provider("DEEPSEEK API")
-    token = os.environ.get("DEEPSEEK_API_KEY") or load_plugin_env().get("DEEPSEEK_API_KEY")
-    if not token:
-        provider.status, provider.error = "unconfigured", "set DEEPSEEK_API_KEY in plugin config .env"
-        return provider
     request = urllib.request.Request(
         "https://api.deepseek.com/user/balance",
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "User-Agent": "herdr-quota/0.1.0"},
@@ -436,6 +509,17 @@ def deepseek_collect() -> Provider:
     except Exception as exc:
         provider.status, provider.error = "error", str(exc)
     return provider
+
+
+def deepseek_collect() -> Provider:
+    token = os.environ.get("DEEPSEEK_API_KEY") or load_plugin_env().get("DEEPSEEK_API_KEY")
+    if not token:
+        return Provider(
+            "DEEPSEEK API",
+            status="unconfigured",
+            error="set DEEPSEEK_API_KEY in plugin config .env",
+        )
+    return collect_with_retry(lambda: _deepseek_collect_once(token))
 
 
 def bar(percent: int, width: int) -> str:
@@ -469,9 +553,9 @@ def render(store: Store, refreshing: bool) -> tuple[int, int, int] | None:
     lines.append("│ " + MAUVE + head + MUTED + " " * gap + right + " │")
     lines.append("├" + "─" * (width - 2) + "┤")
     for provider in store.snapshot():
-        state_color = GREEN if provider.status == "ok" else (YELLOW if provider.status in ("loading", "empty", "unsupported", "unconfigured") else RED)
+        state_color = GREEN if provider.status == "ok" else (YELLOW if provider.status in ("loading", "empty", "unsupported", "unconfigured", "stale") else RED)
         header = provider.name
-        state = provider.status
+        state = f"stale {format_age(provider.updated_at)}" if provider.status == "stale" else provider.status
         button = "[⚙]" if provider.name == "DEEPSEEK API" and provider.status == "unconfigured" else ""
         right = state + (f"  {button}" if button else "")
         weekly_window = next((window for window in provider.windows if window.label == "weekly"), None)
@@ -576,12 +660,14 @@ def refresh(store: Store, flag: list[bool]) -> None:
         deepseek_collect,
     )
     threads = []
-    for collector in collectors:
+    for index, collector in enumerate(collectors):
         thread = threading.Thread(target=lambda fn=collector: store.put(fn()), daemon=True)
         thread.start()
         threads.append(thread)
+        if index + 1 < len(collectors):
+            time.sleep(COLLECTOR_STAGGER_SECONDS)
     for thread in threads:
-        thread.join(timeout=18)
+        thread.join(timeout=COLLECTOR_JOIN_TIMEOUT_SECONDS)
     flag[0] = False
 
 
@@ -638,7 +724,7 @@ def main() -> int:
                 last_config_mtime = current_mtime
                 if not refreshing[0]:
                     threading.Thread(target=refresh, args=(store, refreshing), daemon=True).start()
-            if time.monotonic() - last_auto >= 60 and not refreshing[0]:
+            if time.monotonic() - last_auto >= AUTO_REFRESH_SECONDS and not refreshing[0]:
                 threading.Thread(target=refresh, args=(store, refreshing), daemon=True).start()
                 last_auto = time.monotonic()
     finally:
