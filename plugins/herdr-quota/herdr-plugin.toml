@@ -1,15 +1,15 @@
 id = "herdr.quota"
 name = "Herdr Quota"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.7.0"
-description = "Live subscription limits for Codex, Claude and Kimi plus DeepSeek API balance."
+description = "Live subscription limits for Codex, Claude, Kimi and Qwen plus DeepSeek API balance."
 platforms = ["linux", "macos"]
 
 [[panes]]
 id = "dashboard"
 title = "LLM Usage"
 placement = "split"
-command = ["/bin/sh", "-c", "exec /usr/bin/python3 \"$HERDR_PLUGIN_ROOT/bin/dashboard.py\""]
+command = ["/bin/sh", "-c", "export HERDR_PLUGIN_CONFIG_DIR=\"${HERDR_PLUGIN_CONFIG_DIR:-$HOME/.config/herdr/plugins/config/herdr.quota}\"; exec /usr/bin/python3 \"$HERDR_PLUGIN_ROOT/bin/dashboard.py\""]
 
 [[panes]]
 id = "deepseek-config"
@@ -34,3 +34,9 @@ id = "configure-deepseek"
 title = "Quota: configure DeepSeek securely"
 description = "Enter a DeepSeek key in a masked popup, validate it, and save it with mode 0600."
 command = ["/bin/sh", "bin/open-deepseek-config.sh"]
+
+[[actions]]
+id = "refresh-qwen"
+title = "Quota: refresh Qwen session cookies"
+description = "Open a Brave window with a debug port, log in to qwencloud.com there, and refresh the Qwen session."
+command = ["/bin/sh", "bin/refresh-qwen-cookies.sh"]

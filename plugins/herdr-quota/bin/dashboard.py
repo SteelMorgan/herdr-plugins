@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import pty
@@ -13,11 +14,13 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import termios
 import threading
 import time
 import tty
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -46,6 +49,21 @@ USAGE_PARSED_QUIET_SECONDS = 1.0
 TRANSIENT_RETRY_DELAYS_SECONDS = (0.5, 1.5)
 COLLECTOR_STAGGER_SECONDS = 1.5
 COLLECTOR_JOIN_TIMEOUT_SECONDS = 70
+KIMI_CODE_BASE_URL = "https://api.kimi.com/coding/v1"
+KIMI_CODE_USAGE_URL = f"{KIMI_CODE_BASE_URL}/usages"
+KIMI_CREDENTIAL_PATHS = (
+    Path.home() / ".kimi-code" / "credentials" / "kimi-code.json",
+    Path.home() / ".kimi" / "credentials" / "kimi-code.json",
+)
+KIMI_WEB_BASE_URL = "https://www.kimi.com/apiv2"
+KIMI_WEB_AUTH_URL = "https://auth.kimi.com/api/account.gateway.v1.AuthService/RefreshToken"
+KIMI_WEB_STATS_URL = f"{KIMI_WEB_BASE_URL}/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats"
+KIMI_WEB_TOKEN_PATH = Path(__file__).resolve().parents[1] / ".secrets" / "kimi-web-token.json"
+QWEN_WEB_HOME = "https://home.qwencloud.com"
+QWEN_WEB_USER_INFO_URL = f"{QWEN_WEB_HOME}/tool/user/info.json"
+QWEN_WEB_GATEWAY_URL = f"{QWEN_WEB_HOME}/data/api.json"
+QWEN_TEAM_PRODUCT_CODE = "sfm_tokenplanteams_dp_intl"
+QWEN_WEB_SESSION_PATH = Path(__file__).resolve().parents[1] / ".secrets" / "qwen-web-session.json"
 
 
 @dataclass
@@ -71,7 +89,7 @@ class Provider:
 class Store:
     def __init__(self) -> None:
         self.lock = threading.Lock()
-        self.items = {name: Provider(name) for name in ("CODEX", "CLAUDE", "KIMI", "DEEPSEEK API")}
+        self.items = {name: Provider(name) for name in ("CODEX", "CLAUDE", "KIMI", "QWEN", "DEEPSEEK API")}
 
     def put(self, provider: Provider) -> None:
         now = time.time()
@@ -193,6 +211,15 @@ def format_burn(window: Window) -> str:
     if rate >= 100:
         return "x99+"
     return f"x{rate:.1f}"
+
+
+def format_window_reset(window: Window, compact: bool) -> tuple[str, int]:
+    """Show the time remaining until any quota window resets."""
+    reset_seconds = parse_duration_seconds(window.reset_text) if window.reset_text else (
+        max(0, window.resets_at - int(time.time())) if window.resets_at else None
+    )
+    reset_width = 5 if compact else 8
+    return truncate(format_countdown(reset_seconds, compact=compact), reset_width), reset_width
 
 
 def _codex_collect_once(binary: str) -> Provider:
@@ -472,12 +499,407 @@ def usage_cli_collect(name: str, command: str, startup_wait: float = 5.0) -> Pro
     return collect_with_retry(lambda: _usage_cli_collect_once(name, binary, startup_wait))
 
 
+def parse_quota_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_kimi_total_quota(payload: object) -> Window | None:
+    """Convert Kimi's optional totalQuota aggregate into a monthly window."""
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("totalQuota") or payload.get("total_quota")
+    if not isinstance(raw, dict):
+        return None
+
+    limit = parse_quota_int(raw.get("limit"))
+    remaining = parse_quota_int(raw.get("remaining"))
+    used = parse_quota_int(raw.get("used"))
+    if limit is None or limit <= 0:
+        return None
+    if used is None and remaining is not None:
+        used = limit - remaining
+    if used is None:
+        return None
+
+    used = max(0, min(limit, used))
+    reset_value = raw.get("resetTime") or raw.get("reset_time")
+    reset_text = str(reset_value) if isinstance(reset_value, str) else ""
+    return Window(
+        "monthly",
+        max(0, min(100, round(used * 100 / limit))),
+        resets_at=iso_epoch(reset_text),
+    )
+
+
+def parse_quota_float(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and number not in (float("inf"), float("-inf")) else None
+
+
+def parse_ratio_percent(value: object) -> int | None:
+    ratio = parse_quota_float(value)
+    if ratio is None:
+        return None
+    if 0 <= ratio <= 1:
+        ratio *= 100
+    if not 0 <= ratio <= 100:
+        return None
+    return max(0, min(100, round(ratio)))
+
+
+def parse_kimi_timestamp(value: object) -> int | None:
+    if isinstance(value, str):
+        return iso_epoch(value)
+    if not isinstance(value, dict):
+        return None
+    for key in ("timestamp", "time", "value"):
+        nested = value.get(key)
+        if nested is not None:
+            parsed = parse_kimi_timestamp(nested)
+            if parsed is not None:
+                return parsed
+    seconds = parse_quota_int(value.get("seconds"))
+    return seconds if seconds is not None else None
+
+
+def parse_kimi_subscription_balance(payload: object) -> Window | None:
+    """Convert Kimi web membership stats into the shared monthly window."""
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("subscriptionBalance") or payload.get("subscription_balance")
+    if not isinstance(raw, dict):
+        balances = payload.get("balances") or []
+        if isinstance(balances, list):
+            raw = next((item for item in balances if isinstance(item, dict)), None)
+    if not isinstance(raw, dict):
+        return None
+
+    used_percent = parse_ratio_percent(raw.get("amountUsedRatio", raw.get("amount_used_ratio")))
+    if used_percent is None:
+        amount = parse_quota_float(raw.get("amount"))
+        amount_left = parse_quota_float(raw.get("amountLeft", raw.get("amount_left")))
+        if amount is not None and amount > 0 and amount_left is not None:
+            used_percent = max(0, min(100, round((amount - amount_left) * 100 / amount)))
+    if used_percent is None:
+        return None
+
+    reset_value = raw.get("expireTime", raw.get("expire_time"))
+    if reset_value is None:
+        upcoming = raw.get("upcomingExpiration", raw.get("upcoming_expiration"))
+        if isinstance(upcoming, dict):
+            reset_value = upcoming.get("timestamp", upcoming.get("time"))
+    return Window("monthly", used_percent, resets_at=parse_kimi_timestamp(reset_value))
+
+
+def load_kimi_access_token() -> str | None:
+    """Read the existing Kimi Code OAuth token without exposing or persisting it."""
+    for path in KIMI_CREDENTIAL_PATHS:
+        try:
+            credentials = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        token = credentials.get("access_token") if isinstance(credentials, dict) else None
+        if isinstance(token, str) and token.strip():
+            return token
+    return None
+
+
+def kimi_web_token_path() -> Path:
+    configured = os.environ.get("KIMI_WEB_TOKEN_FILE")
+    return Path(configured) if configured else KIMI_WEB_TOKEN_PATH
+
+
+def load_kimi_web_tokens() -> tuple[str, str | None] | None:
+    path = kimi_web_token_path()
+    try:
+        credentials = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(credentials, dict):
+        return None
+    access = credentials.get("access_token") or credentials.get("accessToken")
+    refresh = credentials.get("refresh_token") or credentials.get("refreshToken")
+    if not isinstance(access, str) or not access.strip():
+        return None
+    return access, refresh if isinstance(refresh, str) and refresh.strip() else None
+
+
+def kimi_web_device_id(token: str) -> str | None:
+    try:
+        payload_part = token.split(".")[1]
+        padding = "=" * (-len(payload_part) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_part + padding))
+    except (IndexError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    device_id = payload.get("device_id") if isinstance(payload, dict) else None
+    return str(device_id) if device_id else None
+
+
+def save_kimi_web_tokens(access: str, refresh: str) -> None:
+    """Atomically rotate the local cache, keeping the secret out of logs."""
+    path = kimi_web_token_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=".kimi-web-token.", suffix=".tmp", delete=False
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            json.dump(
+                {
+                    "provider": "kimi-web",
+                    "origin": "https://www.kimi.ai",
+                    "access_token": access,
+                    "refresh_token": refresh,
+                    "updated_at": datetime.now().astimezone().isoformat(),
+                },
+                temporary,
+                indent=2,
+            )
+            temporary.write("\n")
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, path)
+        os.chmod(path, 0o600)
+    except OSError:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def kimi_web_post(url: str, payload: dict[str, object], token: str | None = None) -> tuple[int, object | None]:
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "herdr-quota/0.1.0",
+        "x-msh-version": "2.0.0",
+        "x-msh-platform": "web",
+        "X-Language": "en-US",
+        "R-Timezone": time.tzname[0] if time.tzname else "UTC",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+        device_id = kimi_web_device_id(token)
+        if device_id:
+            headers["x-msh-device-id"] = device_id
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            return response.status, json.load(response)
+    except urllib.error.HTTPError as exc:
+        return exc.code, None
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+        return 0, None
+
+
+def kimi_web_monthly_collect() -> Window | None:
+    tokens = load_kimi_web_tokens()
+    if tokens is None:
+        return None
+    access, refresh = tokens
+    status, payload = kimi_web_post(KIMI_WEB_STATS_URL, {}, access)
+    if status == 401 and refresh:
+        refresh_status, refreshed = kimi_web_post(KIMI_WEB_AUTH_URL, {"refresh_token": refresh})
+        if refresh_status == 200 and isinstance(refreshed, dict):
+            new_access = refreshed.get("accessToken") or refreshed.get("access_token")
+            new_refresh = refreshed.get("refreshToken") or refreshed.get("refresh_token") or refresh
+            if isinstance(new_access, str) and new_access.strip() and isinstance(new_refresh, str) and new_refresh.strip():
+                try:
+                    save_kimi_web_tokens(new_access, new_refresh)
+                except OSError:
+                    pass
+                status, payload = kimi_web_post(KIMI_WEB_STATS_URL, {}, new_access)
+    if status != 200:
+        return None
+    return parse_kimi_subscription_balance(payload)
+
+
+def kimi_monthly_collect(token: str) -> Window | None:
+    base_url = os.environ.get("KIMI_CODE_BASE_URL", KIMI_CODE_BASE_URL)
+    request = urllib.request.Request(
+        f"{base_url.rstrip('/')}/usages",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "herdr-quota/0.1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            return parse_kimi_total_quota(json.load(response))
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError, TimeoutError, ValueError):
+        return None
+
+
+def kimi_collect() -> Provider:
+    provider = usage_cli_collect("KIMI", "kimi")
+    monthly = kimi_web_monthly_collect()
+    if monthly is None:
+        token = load_kimi_access_token()
+        monthly = kimi_monthly_collect(token) if token else None
+    if monthly is not None:
+        provider.windows = [window for window in provider.windows if window.label != "monthly"]
+        provider.windows.append(monthly)
+        if monthly.used_percent >= 100:
+            provider.status, provider.error = "depleted", ""
+        elif provider.status in ("empty", "unsupported", "unavailable"):
+            provider.status, provider.error = "ok", ""
+    return provider
+
+
+def qwen_web_session_path() -> Path:
+    configured = os.environ.get("QWEN_WEB_SESSION_FILE")
+    return Path(configured) if configured else QWEN_WEB_SESSION_PATH
+
+
+def load_qwen_cookie() -> str | None:
+    """Read the qwencloud.com session cookie; env/config win over the secret file."""
+    cookie = os.environ.get("QWENCLOUD_COOKIES") or load_plugin_env().get("QWENCLOUD_COOKIES")
+    if isinstance(cookie, str) and cookie.strip():
+        return cookie.strip()
+    try:
+        session = json.loads(qwen_web_session_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    cookie = session.get("cookie") if isinstance(session, dict) else None
+    return cookie.strip() if isinstance(cookie, str) and cookie.strip() else None
+
+
+def qwen_web_sec_token(cookie: str) -> tuple[str, str | None]:
+    """Resolve the console CSRF token; returns (status, sec_token)."""
+    request = urllib.request.Request(
+        QWEN_WEB_USER_INFO_URL,
+        headers={"Cookie": cookie, "User-Agent": "herdr-quota/0.1.0"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            info = json.load(response)
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError, TimeoutError, ValueError):
+        return "error", None
+    if not isinstance(info, dict):
+        return "error", None
+    sec = (info.get("data") or {}).get("secToken")
+    if info.get("code") == "ConsoleNeedLogin" or not isinstance(sec, str) or sec in ("", "0"):
+        return "expired", None
+    return "ok", sec
+
+
+def qwen_web_post(cookie: str, sec_token: str, product: str, action: str, params: dict[str, object], region: str, language: str) -> tuple[int, object | None]:
+    body = urllib.parse.urlencode({
+        "product": product,
+        "action": action,
+        "sec_token": sec_token,
+        "region": region,
+        "language": language,
+        "params": json.dumps(params),
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        f"{QWEN_WEB_GATEWAY_URL}?product={product}&action={action}",
+        data=body,
+        headers={
+            "Cookie": cookie,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "herdr-quota/0.1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            return response.status, json.load(response)
+    except urllib.error.HTTPError as exc:
+        return exc.code, None
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+        return 0, None
+
+
+def _qwen_collect_once(cookie: str) -> Provider:
+    provider = Provider("QWEN")
+    status, sec = qwen_web_sec_token(cookie)
+    if status == "expired":
+        provider.status, provider.error = "error", "session expired — run the refresh-qwen action"
+        return provider
+    if status == "error" or not sec:
+        provider.status, provider.error = "error", "qwencloud console unreachable"
+        return provider
+
+    code, payload = qwen_web_post(
+        cookie, sec, "BssOpenAPI-V3", "GetSeatSubscriptionSummary",
+        {"productCode": QWEN_TEAM_PRODUCT_CODE}, "cn-hangzhou", "zh-CN",
+    )
+    data = payload.get("data") if isinstance(payload, dict) else None
+    data = data.get("Data") if isinstance(data, dict) else None
+    groups = data.get("SubscriptionGroupList") if isinstance(data, dict) else None
+    if code != 200 or not isinstance(data, dict) or not isinstance(groups, list) or not groups:
+        provider.status, provider.error = "error", f"seat summary unavailable (HTTP {code})"
+        return provider
+
+    total = surplus = 0.0
+    resets_at = 0
+    specs: list[str] = []
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        spec = str(group.get("SpecType") or "").lower()
+        if spec:
+            specs.append(spec)
+        resets_at = max(resets_at, parse_quota_int(group.get("NextCycleFlushTime")) or parse_quota_int(data.get("EndTime")) or 0)
+        for equity in group.get("EquityList") or []:
+            if isinstance(equity, dict):
+                total += parse_quota_float(equity.get("TotalValue")) or 0
+                surplus += parse_quota_float(equity.get("SurplusValue")) or 0
+    start_ms = parse_quota_int(data.get("StartTime")) or 0
+    if total > 0 and resets_at > start_ms:
+        used = max(0, min(100, round((total - surplus) / total * 100)))
+        provider.windows.append(Window("monthly", used, resets_at // 1000, (resets_at - start_ms) // 60000))
+    provider.plan = f"token plan {'/'.join(specs)} · {total - surplus:,.0f}/{total:,.0f} credits"
+
+    if not provider.windows:
+        provider.status, provider.error = "empty", "no token-plan subscription"
+    elif provider.windows[0].used_percent >= 100:
+        provider.status = "depleted"
+    else:
+        provider.status = "ok"
+    return provider
+
+
+def qwen_collect() -> Provider:
+    cookie = load_qwen_cookie()
+    if not cookie:
+        return Provider("QWEN", status="unconfigured", error="run the refresh-qwen action and log in")
+    return collect_with_retry(lambda: _qwen_collect_once(cookie))
+
+
+def plugin_config_path() -> Path:
+    config_dir = os.environ.get("HERDR_PLUGIN_CONFIG_DIR")
+    if config_dir:
+        return Path(config_dir) / ".env"
+    return Path.home() / ".config" / "herdr" / "plugins" / "config" / "herdr.quota" / ".env"
+
+
 def load_plugin_env() -> dict[str, str]:
     values: dict[str, str] = {}
-    config_dir = os.environ.get("HERDR_PLUGIN_CONFIG_DIR")
-    if not config_dir:
-        return values
-    path = Path(config_dir) / ".env"
+    path = plugin_config_path()
     try:
         for raw in path.read_text(encoding="utf-8").splitlines():
             line = raw.strip()
@@ -544,10 +966,10 @@ def render(store: Store, refreshing: bool) -> tuple[int, int, int] | None:
     lines.append(MUTED + "┌" + "─" * (width - 2) + "┐")
     stamp = datetime.now().strftime("%H:%M:%S")
     if inner >= 45:
-        head = "spent · weekly pace"
+        head = "spent · pace"
         right = "updating…" if refreshing else f"updated {stamp}"
     else:
-        head = "spent · weekly"
+        head = "spent"
         right = ""
     gap = max(1, inner - len(head) - len(right))
     lines.append("│ " + MAUVE + head + MUTED + " " * gap + right + " │")
@@ -558,10 +980,13 @@ def render(store: Store, refreshing: bool) -> tuple[int, int, int] | None:
         state = f"stale {format_age(provider.updated_at)}" if provider.status == "stale" else provider.status
         button = "[⚙]" if provider.name == "DEEPSEEK API" and provider.status == "unconfigured" else ""
         right = state + (f"  {button}" if button else "")
-        weekly_window = next((window for window in provider.windows if window.label == "weekly"), None)
-        if weekly_window:
-            pace = format_burn(weekly_window)
-            pace_rate = burn_rate(weekly_window)
+        pace_window = next(
+            (window for window in provider.windows if window.label == "weekly"),
+            next((window for window in provider.windows if window.label == "monthly"), None),
+        )
+        if pace_window:
+            pace = format_burn(pace_window)
+            pace_rate = burn_rate(pace_window)
             pace_color = RED if pace_rate is not None and pace_rate >= 1.5 else (YELLOW if pace_rate is not None and pace_rate > 1 else GREEN)
             pace_padding = max(1, 9 - len(header))
             left_width = len(header) + pace_padding + 5
@@ -576,21 +1001,17 @@ def render(store: Store, refreshing: bool) -> tuple[int, int, int] | None:
         if provider.plan:
             content = f"plan  {provider.plan}"
             lines.append("│ " + TEXT + truncate(content, inner).ljust(inner) + MUTED + " │")
-        ordered_windows = sorted(provider.windows, key=lambda window: (0 if window.label == "weekly" else 1 if window.label in ("5 hour", "5 day") else 2, window.label))
-        for window in ordered_windows[:2]:
+        window_order = {"monthly": 0, "weekly": 1, "5 hour": 2, "5 day": 3}
+        ordered_windows = sorted(provider.windows, key=lambda window: (window_order.get(window.label, 4), window.label))
+        for window in ordered_windows[:3]:
             compact = inner < 35
-            reset_width = 5 if compact else 8
-            reset_seconds = parse_duration_seconds(window.reset_text) if window.reset_text else (max(0, window.resets_at - int(time.time())) if window.resets_at else None)
-            reset = truncate(
-                format_countdown(reset_seconds, compact=compact),
-                reset_width,
-            )
+            reset, reset_width = format_window_reset(window, compact)
             if compact:
-                label = "week" if window.label == "weekly" else ("5h" if window.label == "5 hour" else "5d" if window.label == "5 day" else truncate(window.label, 4))
-                bar_width = max(1, inner - 16)
+                label = "week" if window.label == "weekly" else ("mo" if window.label == "monthly" else ("5h" if window.label == "5 hour" else "5d" if window.label == "5 day" else truncate(window.label, 4)))
+                bar_width = max(1, inner - 11 - reset_width)
                 row = f"{label:<4} {bar(window.used_percent, bar_width)} {window.used_percent:>3}% {MUTED}{reset:>{reset_width}}{RESET}{BG}"
             else:
-                bar_width = max(1, inner - 25)
+                bar_width = max(1, inner - 17 - reset_width)
                 row = f"{window.label:<8} {bar(window.used_percent, bar_width)}  {window.used_percent:>3}%  {MUTED}{reset:>{reset_width}}{RESET}{BG}"
             lines.append("│ " + TEXT + row + MUTED + " │")
         for detail in provider.details[:2]:
@@ -641,8 +1062,7 @@ def read_input(fd: int) -> tuple[str, tuple[int, int] | None]:
 
 
 def config_mtime() -> float:
-    config_dir = os.environ.get("HERDR_PLUGIN_CONFIG_DIR")
-    path = Path(config_dir) / ".env" if config_dir else Path.home() / ".config" / "herdr" / "plugins" / "config" / "herdr.quota" / ".env"
+    path = plugin_config_path()
     try:
         return path.stat().st_mtime
     except FileNotFoundError:
@@ -656,7 +1076,8 @@ def refresh(store: Store, flag: list[bool]) -> None:
     collectors = (
         codex_collect,
         claude_collect,
-        lambda: usage_cli_collect("KIMI", "kimi"),
+        kimi_collect,
+        qwen_collect,
         deepseek_collect,
     )
     threads = []
@@ -677,6 +1098,7 @@ def diagnose() -> int:
         "codex": find_binary("codex") or "missing",
         "claude": find_binary("claude") or "missing",
         "kimi": find_binary("kimi") or "missing",
+        "qwen_session": "configured" if load_qwen_cookie() else "missing",
         "deepseek_key": "configured" if os.environ.get("DEEPSEEK_API_KEY") or env.get("DEEPSEEK_API_KEY") else "missing",
         "plugin_config": os.environ.get("HERDR_PLUGIN_CONFIG_DIR", "not provided"),
     }
