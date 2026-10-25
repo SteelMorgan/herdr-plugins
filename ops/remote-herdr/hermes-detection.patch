@@ -1,0 +1,11 @@
+--- a/usr/local/sbin/gbig-agent-route
++++ b/usr/local/sbin/gbig-agent-route
+@@ -2,7 +2,7 @@
+ """Fixed app routing; enter namespace as root, then execute only as hermes."""
+ import json,os,pwd,sys,urllib.request,stat
+ APPS={
+- 'hermes':('vpn',['/opt/hermes-admin/current/.venv/bin/python','-I','-B','/opt/hermes-admin/current/launch.py']),
++ 'hermes':('vpn',['/opt/hermes-admin/current/.venv/bin/python','-I','-B','/usr/local/libexec/gbig-herdr/hermes']),
+  'claude':('vpn',['/home/hermes/.local/lib/gbig-cli/claude']),
+  'codex':('vpn',['/home/hermes/.local/lib/gbig-cli/codex']),
+  'mimo':('direct',['/home/hermes/.mimocode/bin/mimo']),
