@@ -266,8 +266,8 @@ def lines(data,now,width):
     return out
 
 
-def render(data,busy,width,height):
-    rows=lines(data,time.time(),width);footer=(' r refresh light metrics | q close | collecting...' if busy else ' r refresh light metrics | q close | SSH read-only, no disk self-tests')
+def render_details(data,busy,width,height):
+    rows=lines(data,time.time(),width);footer=(' d overview | r refresh light metrics | q close | collecting...' if busy else ' d overview | r refresh light metrics | q close | SSH read-only, no disk self-tests')
     limit=max(1,height-1)
     if len(rows)>limit:
         # Hide cosmetic headings before dropping measurements on short terminals.
@@ -277,12 +277,19 @@ def render(data,busy,width,height):
     return ESC+'H'+'\r\n'.join(BG+color+text[:width].ljust(width)+RESET for text,color in rows+[(footer,MUTED)])+ESC+'J'
 
 
+def render(data,busy,width,height,details=False):
+    if details:return render_details(data,busy,width,height)
+    from presentation import overview
+    return overview(data,busy,width,height,sys.modules[__name__])
+
+
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--diagnose',action='store_true');args=parser.parse_args()
     store=Store()
     if args.diagnose:
         store.collect();data,_=store.snapshot();print(json.dumps(data,indent=2));return
     if not sys.stdin.isatty() or not sys.stdout.isatty():raise SystemExit('Dashboard requires a PTY')
+    details=False
     previous=termios.tcgetattr(sys.stdin.fileno());tty.setcbreak(sys.stdin.fileno())
     try:
         sys.stdout.write(ESC+'?1049h'+ESC+'?25l');sys.stdout.flush()
@@ -291,11 +298,12 @@ def main():
             if not busy and now-store.last_attempt>=30:
                 threading.Thread(target=store.collect,daemon=True).start()
             columns,rows=shutil.get_terminal_size((129,28))
-            sys.stdout.write(render(data,busy,columns,rows));sys.stdout.flush()
+            sys.stdout.write(render(data,busy,columns,rows,details));sys.stdout.flush()
             ready,_,_=select.select([sys.stdin],[],[],1)
             if ready:
                 key=os.read(sys.stdin.fileno(),1)
                 if key in [b'q',b'Q',b'\x03',b'\x04']:break
+                if key.lower()==b'd':details=not details
                 if key.lower()==b'r' and not busy and time.time()-store.last_attempt>=5:
                     # Fast only; cached SMART/VM/backup timestamps are not invalidated.
                     with store.lock:store.data['groups'].get('fast',{})['received_at']=0

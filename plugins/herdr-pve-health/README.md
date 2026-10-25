@@ -49,3 +49,17 @@ python3 -m unittest discover -s plugins/herdr-pve-health/tests -v
 The established `dashboards` workspace has resources and usage side by side above
 this full-width bottom panel. The shared resources-plugin startup restorer resumes
 existing designated shell panes without changing focus or restarting live TUIs.
+
+## Overview and detail view
+
+The default Russian-language overview uses four metric cards (CPU, memory,
+network, CPU temperature), then storage/SMART and VM cards, followed by application
+connectivity and backups. It fits a 127 × 26 content viewport in the lower half
+of the dashboards workspace. Color is reinforced with words/symbols. The summary
+shows failures and missing/stale data rather than deriving health from SSH alone.
+
+Press `d` to toggle full technical details (serials, raw SMART attributes,
+per-VM archive ages, PSI and probe costs); press `d` again for the overview.
+`r` refreshes light metrics only. Collection intervals and cache are shared between
+views and are unaffected by toggling. Narrow/short panes display an explicit
+notice when cards cannot all fit; resize or use details.
