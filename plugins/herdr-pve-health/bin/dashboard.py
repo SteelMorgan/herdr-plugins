@@ -137,6 +137,8 @@ class Store:
         except (OSError,ValueError):self.data={'groups':{}}
         if self.data.get('config_id')!=CONFIG_ID:self.data={'groups':{},'config_id':CONFIG_ID}
         self.data.setdefault('groups',{})
+        if (self.data['groups'].get('backups',{}).get('data') or {}).get('task_index_version')!=1:
+            self.data['groups'].pop('backups',None)
     def snapshot(self):
         with self.lock:return json.loads(json.dumps(self.data)),self.busy
     def collect(self):
@@ -251,10 +253,10 @@ def lines(data,now,width):
     vpn=group('vpn') or {}
     add(f" VPN(5m) interfaces {vpn.get('interfaces','--')} peers {vpn.get('peers','--')} recent {vpn.get('recent','--')} latest handshake {age(vpn.get('latest'),now)} | idle peers are normal",TEXT if fresh('vpn') and vpn.get('interfaces') else YELLOW)
     backup=group('backups') or {};rows=backup.get('vms',[])
-    stale=any(not x.get('completed_at') or now-x['completed_at']>36*3600 or not x.get('identity_matches') for x in rows)
+    stale=any(not x.get('completed_at') or now-x['completed_at']>24*3600 or not x.get('identity_matches') for x in rows)
     add(' BACKUP VM ages: '+' | '.join(f"{x['vmid']} {age(x.get('completed_at'),now)}" for x in rows)+f" | host {age(backup.get('host_completed_at'),now)}",YELLOW if stale or not fresh('backups') else TEXT)
     jobs=backup.get('jobs',[]);enabled=sum(bool(x.get('enabled',True)) for x in jobs)
-    add(f" BACKUP jobs {enabled}/{len(jobs)} enabled | published {age(backup.get('published_at'),now)} | checksums recorded at backup, age limit 36h",YELLOW if not enabled or backup.get('jobs_error') else MUTED)
+    add(f" BACKUP jobs {enabled}/{len(jobs)} enabled | published {age(backup.get('published_at'),now)} | last {(backup.get('last_task') or {}).get('status','unknown')[:35]} | active {backup.get('active_tasks','--')} | limit 24h",YELLOW if not enabled or backup.get('jobs_error') else MUTED)
     win=data.get('windows_backup') or {};same=win.get('ServerGeneratedAt')==backup.get('published_at') and win.get('Status')=='success'
     add(f" WINDOWS D: {win.get('Status','unknown')} {win.get('CompletedAt','--')[:19]} | verified {win.get('VerifiedFiles','--')}/6 | {'latest published set copied' if same else 'not matched to current export'}",TEXT if same else YELLOW)
     errs=group('errors') or {};counts=errs.get('counts',{})

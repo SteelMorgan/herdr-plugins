@@ -107,8 +107,11 @@ def overview(data, busy, width, height, d, now=None):
     failed=svc.get('failed',[])+[x.get('Id','?') for x in svc.get('units',[]) if x.get('ActiveState')!='active']
     if failed:issues.append('службы: '+', '.join(sorted(set(clean(x) for x in failed))))
     if any(errors.values()) and fresh('errors'):issues.append('ошибки ядра за 30 мин');critical=True
-    if any(not x.get('completed_at') or now-x['completed_at']>36*3600 or not x.get('identity_matches') for x in archives):
+    if any(not x.get('completed_at') or now-x['completed_at']>24*3600 or not x.get('identity_matches') for x in archives):
         issues.append('проверить бекапы VM')
+    last_task=backup.get('last_task') or {}
+    if last_task and last_task.get('status')!='OK':issues.append('последнее задание бекапа: ошибка')
+    if backup.get('task_history_error'):issues.append('история бекапов недоступна')
     # Summary must reflect failed/stale groups even when the host itself is live.
     missing=[k for k in d.INTERVALS if not fresh(k)]
     if missing:issues.append('нет свежих данных: '+', '.join(missing))
@@ -185,18 +188,18 @@ def overview(data, busy, width, height, d, now=None):
                   paint('Ядро: I/O '+str(errors.get('io','—'))+' · OOM '+str(errors.get('oom','—'))+' · reset '+str(errors.get('reset','—'))+'  / 30 мин',RED if any(errors.values()) else DIM)]
     vm_age='VM '+ ' · '.join(str(x['vmid']) for x in archives) + '  / возраст — в деталях'
     oldest=min((x['completed_at'] for x in archives if x.get('completed_at')),default=None)
-    all_backups=bool(archives) and all(x.get('completed_at') and now-x['completed_at']<=36*3600 and x.get('identity_matches') for x in archives)
+    all_backups=bool(archives) and all(x.get('completed_at') and now-x['completed_at']<=24*3600 and x.get('identity_matches') for x in archives)
     completed=win.get('CompletedAt','')
-    backup_rows=[paint('VM: '+age(oldest)+' назад  ')+flag(all_backups,'backups')+paint('  предел 36 ч',DIM),
+    backup_rows=[paint('VM: '+age(oldest)+' назад  ')+flag(all_backups,'backups')+paint('  предел 24 ч',DIM),
                  paint(vm_age or 'Архивы VM: нет данных',DIM),
                  paint('Windows D: ')+paint('● СКОПИРОВАНО' if same else '● ПРОВЕРИТЬ',GREEN if same and fresh('backups') else YELLOW)
                  +paint('  '+(completed[8:10]+'.'+completed[5:7]+' '+completed[11:16] if completed else '—')+' · '+str(win.get('VerifiedFiles','—'))+'/6',DIM),
-                 paint('Хост '+age(backup.get('host_completed_at'))+' · задания '+str(enabled)+'/'+str(len(jobs))+' · SHA при создании',DIM)]
+                 paint('Хост '+age(backup.get('host_completed_at'))+' · расписание '+str(enabled)+'/'+str(len(jobs))+' · запуск '+('OK' if last_task.get('status')=='OK' else 'СБОЙ' if last_task else '—'),YELLOW if last_task and last_task.get('status')!='OK' else DIM)]
     lw=(width-2)//2;rw=width-2-lw
     sections=[('ДИСКИ И МЕСТО',disk_rows,'SMART '+aged('smart')),
               ('ВИРТУАЛЬНЫЕ МАШИНЫ',vm_rows,str(sum(v.get('status')=='running' for v in vms))+'/'+str(len(vms))+' RUN'),
               ('ПРИЛОЖЕНИЯ И СВЯЗЬ',service_rows,'5 мин'),
-              ('РЕЗЕРВНЫЕ КОПИИ',backup_rows,'5 мин')]
+              ('РЕЗЕРВНЫЕ КОПИИ',backup_rows,'ИДЁТ' if backup.get('active_tasks') else '5 мин')]
     if width>=108:
         rows+=columns([card(t,b,w,8,paint(' '+badge+' ',DIM)) for (t,b,badge),w in zip(sections[:2],[lw,rw])])
         rows+=['']

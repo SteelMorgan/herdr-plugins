@@ -63,3 +63,10 @@ per-VM archive ages, PSI and probe costs); press `d` again for the overview.
 `r` refreshes light metrics only. Collection intervals and cache are shared between
 views and are unaffected by toggling. Narrow/short panes display an explicit
 notice when cards cannot all fit; resize or use details.
+
+Backup health also reads a bounded 128 KiB tail of each local PVE task index/active
+file every five minutes, without starting a Perl/API process. It reports the most
+recent completed vzdump result and marks active jobs as in progress. The age warning
+is 24 hours, matching the Windows downloader's per-archive freshness validation;
+the publisher's separate 36-hour rejection guard remains unchanged. Successful
+export/copy timestamps never override stale VM archive timestamps.

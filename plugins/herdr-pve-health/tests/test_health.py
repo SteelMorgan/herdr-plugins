@@ -58,6 +58,17 @@ class HealthContracts(unittest.TestCase):
         self.assertIn('increase pane height',text)
         self.assertEqual(len(text.split('\r\n')),7)
 
+    def test_native_task_failure_and_active_queue_are_distinguished(self):
+        p=load('probe')
+        failed="UPID:node:1:2:3:vzdump::root@pam: A command failed: pvesm missing"
+        unrelated="UPID:node:1:2:3:aptupdate::root@pam: B OK"
+        active="UPID:node:4:5:6:vzdump::root@pam: 0\nUPID:node:1:2:3:vzdump::root@pam: 1 A command failed"
+        last,running=p.parse_backup_tasks(failed+'\n'+unrelated,active)
+        self.assertEqual(last['status'],'command failed: pvesm missing')
+        self.assertEqual(running,1)
+        last,_=p.parse_backup_tasks(failed+'\nUPID:node:4:5:6:vzdump::root@pam: C OK',active)
+        self.assertEqual(last['status'],'OK')
+
     def test_smart_reads_only_real_disks_and_never_starts_tests(self):
         p=load('probe');calls=[]
         def fake(argv,**kw):

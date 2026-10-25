@@ -131,6 +131,33 @@ def errors():
     return {'counts':counts,'last':last[-3:],'scope':'last30m/max80 kernel warnings'}
 
 
+
+def parse_backup_tasks(index,active):
+    last=None
+    for line in index.splitlines():
+        parts=line.split(None,2)
+        if len(parts)!=3:continue
+        fields=parts[0].split(':')
+        if len(fields)<8 or fields[0]!='UPID' or fields[5]!='vzdump':continue
+        try:ended=int(parts[1],16)
+        except ValueError:continue
+        if last is None or ended>=last['ended_at']:
+            last={'ended_at':ended,'status':parts[2][:160]}
+    running=0
+    for line in active.splitlines():
+        parts=line.split(None,2)
+        fields=parts[0].split(':') if parts else []
+        if len(parts)>=2 and parts[1]=='0' and len(fields)>=8 and fields[0]=='UPID' and fields[5]=='vzdump':running+=1
+    return last,running
+
+
+def task_file_tail(path):
+    # Bound work even when task history grows; never launch pvesh per refresh.
+    with Path(path).open('rb') as f:
+        f.seek(0,2);size=f.tell();f.seek(max(0,size-128*1024))
+        return f.read().decode('utf-8',errors='replace')
+
+
 def backups():
     rows=[]
     for vmid in [100,110,111,200,201]:
@@ -160,7 +187,12 @@ def backups():
                 if len(parts)==2 and parts[0] in ['enabled','schedule','vmid','storage']:
                     current[parts[0]]=int(parts[1]) if parts[0]=='enabled' else parts[1]
     except Exception as e:jobs_error=str(e)
-    return {'vms':rows,'published_at':published,'host_completed_at':host,'jobs':jobs,'jobs_error':jobs_error}
+    last_task=None;active_tasks=None;history_error=None
+    try:
+        last_task,active_tasks=parse_backup_tasks(task_file_tail('/var/log/pve/tasks/index'),task_file_tail('/var/log/pve/tasks/active'))
+    except OSError as e:history_error=str(e)[:120]
+    return {'vms':rows,'published_at':published,'host_completed_at':host,'jobs':jobs,'jobs_error':jobs_error,
+            'last_task':last_task,'active_tasks':active_tasks,'task_history_error':history_error,'task_index_version':1}
 
 
 def apps():

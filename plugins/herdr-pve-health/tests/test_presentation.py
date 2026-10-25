@@ -57,6 +57,26 @@ class OverviewContracts(unittest.TestCase):
         frame=self.frame(data,now)
         self.assertIn('проверить бекапы VM',frame)
 
+    def test_recent_failed_native_backup_is_visible_before_archives_expire(self):
+        data,now=healthy()
+        data['groups']['backups']['data']['last_task']={'ended_at':now-10,'status':'hook failed'}
+        frame=self.frame(data,now)
+        self.assertIn('последнее задание бекапа: ошибка',frame)
+        self.assertIn('ВНИМАНИЕ',frame.split('\r\n')[0])
+
+    def test_25hour_archive_is_stale_even_with_a_fresh_windows_copy(self):
+        data,now=healthy();now=200000
+        for group in data['groups'].values():group['received_at']=now
+        backup=data['groups']['backups']['data'];backup['vms'][0]['completed_at']=now-25*3600
+        backup['published_at']=now;data['windows_backup']['ServerGeneratedAt']=now
+        frame=self.frame(data,now)
+        self.assertIn('проверить бекапы VM',frame)
+        self.assertIn('предел 24 ч',frame)
+
+    def test_active_backup_has_a_visible_in_progress_badge(self):
+        data,now=healthy();data['groups']['backups']['data']['active_tasks']=1
+        self.assertIn('ИДЁТ',self.frame(data,now))
+
     def test_read_only_filesystem_is_critical(self):
         data,now=healthy();data['groups']['storage']['data']['filesystems'][0]['readonly']=True
         frame=self.frame(data,now)
