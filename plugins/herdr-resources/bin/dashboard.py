@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import select
@@ -32,12 +33,49 @@ MAUVE = f"{ESC}38;2;203;166;247m"
 BLUE = f"{ESC}38;2;137;180;250m"
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
+# Docker Desktop's Linux CLI autolaunches a D-Bus session bus on every
+# `docker info`/`docker stats` when none is set, and those daemons never exit.
+# Polling leaked ~900/hour and exhausted WSL memory, so disable autolaunch
+# unless the environment already provides a shared bus (~/.config/session-bus.sh).
+os.environ.setdefault("DBUS_SESSION_BUS_ADDRESS", "disabled:")
+
+# SSH hosts are sampled less often than the TUI refreshes. One short-lived
+# command reads procfs and the root filesystem; no remote agent is installed.
+SSH_PROBE_INTERVAL_SECONDS = 15.0
+SSH_PROBE_TIMEOUT_SECONDS = 8.0
+SSH_PROBE_SCRIPT = r'''set -eu
+cpu_sample() {
+    awk '$1 == "cpu" { idle = $5 + $6; total = 0; for (i = 2; i <= 8; i++) total += $i; print total, idle; exit }' /proc/stat
+}
+before=$(cpu_sample)
+sleep 0.2
+after=$(cpu_sample)
+awk -v before="$before" -v after="$after" 'BEGIN {
+    split(before, b); split(after, a)
+    total = a[1] - b[1]; idle = a[2] - b[2]
+    if (total > 0) printf "cpu %.1f\n", (total - idle) * 100 / total
+    else print "cpu"
+}'
+awk '
+    /^MemTotal:/ { total = $2 }
+    /^MemAvailable:/ { available = $2 }
+    END {
+        if (total > 0) printf "ram %.1f %d %d\n", (total - available) * 100 / total, total - available, total
+        else print "ram"
+    }
+' /proc/meminfo
+df -Pk / | awk 'NR == 2 { print "disk " $2 " " $3 " " $5 }'
+'''
+SSH_PROBE_LOCK = threading.Lock()
+SSH_PROBE_CACHE: dict[str, tuple[float, subprocess.CompletedProcess[str]]] = {}
+
 
 @dataclass
 class Host:
     key: str
     prefix: str
     kind: str = "ssh"
+    enabled: bool = True
     container: str = ""
     state: str = "unknown"
     running: bool = False
@@ -69,7 +107,24 @@ ENGINE = DockerEngine()
 
 
 def run(args: list[str], timeout: float = 5) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, text=True, capture_output=True, timeout=timeout, check=False)
+    try:
+        return subprocess.run(args, text=True, capture_output=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as exc:
+        stderr = exc.stderr or ""
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+        return subprocess.CompletedProcess(args, 124, "", f"timeout after {timeout:g}s: {stderr}")
+    except OSError as exc:
+        return subprocess.CompletedProcess(args, 127, "", str(exc))
+
+
+def parse_number(value: object, default: float | None = None) -> float | None:
+    """Parse Docker's human-facing numeric fields without crashing the TUI."""
+    try:
+        parsed = float(str(value).strip().rstrip("%"))
+    except (TypeError, ValueError):
+        return default
+    return parsed if math.isfinite(parsed) else default
 
 
 def configured_hosts() -> list[dict[str, object]]:
@@ -106,6 +161,50 @@ def human_kib(value: int) -> str:
     return f"{gib:.1f}G" if gib < 10 else f"{gib:.0f}G"
 
 
+def ssh_probe(target: str) -> subprocess.CompletedProcess[str]:
+    """Collect one cheap remote sample, reusing it between TUI refreshes."""
+    now = time.monotonic()
+    with SSH_PROBE_LOCK:
+        cached = SSH_PROBE_CACHE.get(target)
+        if cached and now - cached[0] < SSH_PROBE_INTERVAL_SECONDS:
+            return cached[1]
+    command = ["ssh"]
+    user_config = Path.home() / ".ssh/config"
+    if user_config.is_file():
+        command.extend(["-F", str(user_config)])
+    command.extend(["-o", "BatchMode=yes", "-o", "ConnectTimeout=3", target, SSH_PROBE_SCRIPT])
+    result = run(command, timeout=SSH_PROBE_TIMEOUT_SECONDS)
+    with SSH_PROBE_LOCK:
+        SSH_PROBE_CACHE[target] = (time.monotonic(), result)
+    return result
+
+
+def apply_ssh_metrics(host: Host, output: str) -> None:
+    """Parse the fixed probe output without relying on remote utilities."""
+    for line in output.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        if fields[0] == "cpu" and len(fields) >= 2:
+            value = parse_number(fields[1])
+            host.cpu = None if value is None else max(0.0, min(100.0, value))
+        elif fields[0] == "ram" and len(fields) >= 4:
+            value = parse_number(fields[1])
+            host.memory = None if value is None else max(0.0, min(100.0, value))
+            try:
+                host.memory_used = human_kib(int(fields[2]))
+                host.memory_limit = human_kib(int(fields[3]))
+            except ValueError:
+                pass
+        elif fields[0] == "disk" and len(fields) >= 4:
+            host.disk = parse_number(fields[3])
+            try:
+                host.disk_total = human_kib(int(fields[1]))
+                host.disk_used = human_kib(int(fields[2]))
+            except ValueError:
+                pass
+
+
 def mirror_state() -> tuple[bool, dict[str, bool]]:
     candidates = sorted((Path.home() / ".config/herdr/plugins/github").glob("mirror-*/target/release/herdr-mirror"))
     if not candidates:
@@ -123,16 +222,24 @@ def collect_one(config: dict[str, object], linked: dict[str, bool]) -> Host:
     key = str(config["key"])
     kind = str(config.get("kind") or "ssh")
     host = Host(key=key, prefix=str(config.get("prefix") or key).upper(), kind=kind)
+    if config.get("enabled") is False:
+        host.enabled = False
+        host.state = "disabled"
+        host.herdr = "disabled"
+        host.container = str(config.get("container") or config.get("target") or "")
+        return host
     try:
         if kind != "docker":
             target = str(config.get("target") or "")
-            probe = run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", target, "true"], timeout=5) if target else None
+            probe = ssh_probe(target) if target else None
             host.container = target
             host.running = bool(probe and probe.returncode == 0)
             host.state = "running" if host.running else "offline"
             host.herdr = "linked" if host.running and linked.get(key) else "down"
             if not host.running:
                 host.error = "SSH host unreachable"
+            else:
+                apply_ssh_metrics(host, probe.stdout)
             return host
         host.container = resolve_container(config)
         if not host.container:
@@ -152,8 +259,8 @@ def collect_one(config: dict[str, object], linked: dict[str, bool]) -> Host:
         stats = run(["docker", "stats", "--no-stream", "--format", "{{json .}}", host.container], timeout=8)
         if stats.returncode == 0 and stats.stdout.strip():
             data = json.loads(stats.stdout.splitlines()[0])
-            host.cpu = float(str(data.get("CPUPerc", "0")).rstrip("%"))
-            host.memory = float(str(data.get("MemPerc", "0")).rstrip("%"))
+            host.cpu = parse_number(data.get("CPUPerc"))
+            host.memory = parse_number(data.get("MemPerc"))
             usage = str(data.get("MemUsage") or "").split("/")
             if len(usage) == 2:
                 host.memory_used, host.memory_limit = map(parse_size, usage)
@@ -162,7 +269,7 @@ def collect_one(config: dict[str, object], linked: dict[str, bool]) -> Host:
         if disk.returncode == 0 and len(lines) >= 2:
             fields = lines[-1].split()
             host.disk_total, host.disk_used = human_kib(int(fields[1])), human_kib(int(fields[2]))
-            host.disk = float(fields[4].rstrip("%"))
+            host.disk = parse_number(fields[4])
         remote = str(config.get("remote_bin") or "herdr")
         command = ["docker", "exec", host.container, *remote.split(), "session", "list", "--json"]
         session = run(command, timeout=5)
@@ -184,7 +291,15 @@ def collect() -> tuple[bool, list[Host]]:
     lock = threading.Lock()
 
     def worker(config: dict[str, object]) -> None:
-        item = collect_one(config, linked)
+        try:
+            item = collect_one(config, linked)
+        except Exception as exc:  # A single malformed host must not kill refresh.
+            item = Host(
+                key=str(config.get("key") or "unknown"),
+                prefix=str(config.get("prefix") or config.get("key") or "unknown").upper(),
+                kind=str(config.get("kind") or "ssh"),
+                error=f"collector failed: {exc}",
+            )
         with lock:
             hosts.append(item)
 
@@ -294,25 +409,28 @@ def collect_docker_engine(hosts: list[Host]) -> DockerEngine:
     engine = DockerEngine()
     info_result = run(["docker", "info", "--format", "{{json .}}"], timeout=5)
     try:
-        info = json.loads(info_result.stdout)
+        parsed_info = json.loads(info_result.stdout)
+        info = parsed_info if isinstance(parsed_info, dict) else {}
     except (ValueError, json.JSONDecodeError):
         info = {}
     stats = run(["docker", "stats", "--no-stream", "--format", "{{json .}}"], timeout=12)
     rows = []
     for line in stats.stdout.splitlines():
         try:
-            rows.append(json.loads(line))
+            row = json.loads(line)
+            if isinstance(row, dict):
+                rows.append(row)
         except json.JSONDecodeError:
             continue
-    raw_cpu = sum(float(str(row.get("CPUPerc") or "0").rstrip("%")) for row in rows)
-    cpus = max(1, int(info.get("NCPU") or 1))
+    raw_cpu = sum(parse_number(row.get("CPUPerc"), 0) or 0 for row in rows)
+    cpus = max(1, int(parse_number(info.get("NCPU"), 1) or 1))
     engine.cpu = raw_cpu / cpus
     engine.cpu_detail = f"{raw_cpu:.0f}%/{cpus * 100}%"
     memory_used = sum(size_bytes(str(row.get("MemUsage") or "").split("/")[0]) for row in rows)
-    memory_limit = float(info.get("MemTotal") or 0)
+    memory_limit = parse_number(info.get("MemTotal"), 0) or 0
     engine.memory = memory_used / memory_limit * 100 if memory_limit else None
     engine.memory_detail = f"{human_bytes(memory_used)}/{human_bytes(memory_limit)}" if memory_limit else ""
-    engine.running = int(info.get("ContainersRunning") or len(rows))
+    engine.running = max(0, int(parse_number(info.get("ContainersRunning"), len(rows)) or 0))
     first_disk = next((host for host in active if host.disk is not None), active[0])
     engine.disk = first_disk.disk
     engine.disk_detail = f"{first_disk.disk_used}/{first_disk.disk_total}".strip("/")
@@ -334,8 +452,8 @@ def render(daemon: bool, hosts: list[Host], width: int, now: float) -> str:
     ssh_hosts = [host for host in hosts if host.kind != "docker"]
     if docker_hosts:
         lines.append(f"{BG}{TEXT}{fit('', width)}")
-        docker_header = (f"LOCAL DOCKER · {ENGINE.running} RUNNING · {len(docker_hosts)} MIRRORED"
-                         if not compact else f"DOCKER {ENGINE.running}↑ · {len(docker_hosts)}M")
+        docker_header = (f"LOCAL DOCKER · {ENGINE.running} RUNNING · {sum(h.enabled for h in docker_hosts)} MIRRORED"
+                         if not compact else f"DOCKER {ENGINE.running}↑ · {sum(h.enabled for h in docker_hosts)}M")
         lines.append(f"{BG}{PANEL}{MAUVE}  {fit(docker_header, inner)}  {RESET}")
         for label, value, detail in (
             ("CPU", ENGINE.cpu, ENGINE.cpu_detail),
@@ -349,6 +467,10 @@ def render(daemon: bool, hosts: list[Host], width: int, now: float) -> str:
         for index, host in enumerate(docker_hosts):
             branch = "└─" if index == len(docker_hosts) - 1 else "├─"
             continuation = "   " if index == len(docker_hosts) - 1 else "│  "
+            if not host.enabled:
+                child = f"{branch} {host.prefix} ○ DISABLED" if compact else f"{branch} {host.prefix:<4} ○ DISABLED · mirror excluded"
+                lines.append(f"{BG}{PANEL}{MUTED}  {fit(child, inner)}  {RESET}")
+                continue
             online = host.running
             state = "● ONLINE" if online else "● OFFLINE"
             herdr = {"linked": "H●LINKED", "ready": "H●READY", "down": "H●DOWN"}.get(host.herdr, "H●DOWN")
@@ -381,6 +503,9 @@ def render(daemon: bool, hosts: list[Host], width: int, now: float) -> str:
 
     for host in ssh_hosts:
         lines.append(f"{BG}{TEXT}{fit('', width)}")
+        if not host.enabled:
+            lines.append(f"{BG}{PANEL}{MUTED}  {fit('SSH · ' + host.prefix + ' ○ DISABLED', inner)}  {RESET}")
+            continue
         online = host.running
         state = "● ONLINE" if online else "● OFFLINE"
         herdr = "H●LINKED" if host.herdr == "linked" else "H●DOWN"
@@ -400,9 +525,18 @@ def render(daemon: bool, hosts: list[Host], width: int, now: float) -> str:
 
 
 def diagnose() -> int:
-    daemon, hosts = collect()
+    daemon, hosts = collect_resilient((False, []))
     print(json.dumps({"mirror_daemon": daemon, "hosts": [host.__dict__ for host in hosts]}, indent=2))
     return 0
+
+
+def collect_resilient(previous: tuple[bool, list[Host]]) -> tuple[bool, list[Host]]:
+    """Keep the last good frame when a new Docker response is unusable."""
+    try:
+        return collect()
+    except Exception as exc:
+        print(f"collector refresh failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        return previous
 
 
 def main() -> int:
@@ -415,7 +549,7 @@ def main() -> int:
     tty.setcbreak(sys.stdin.fileno())
     print(f"{ESC}?1049h{ESC}?25l", end="", flush=True)
     try:
-        daemon, hosts = collect()
+        daemon, hosts = collect_resilient((False, []))
         refreshed = time.time()
         while True:
             width = shutil.get_terminal_size((60, 30)).columns
@@ -427,7 +561,7 @@ def main() -> int:
                     break
                 if key not in (b"r", b"R"):
                     continue
-            daemon, hosts = collect()
+            daemon, hosts = collect_resilient((daemon, hosts))
             refreshed = time.time()
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)

@@ -1,0 +1,27 @@
+id = "herdr.codex-capacity-guard"
+name = "Herdr Codex Capacity Guard"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Retries a Codex capacity error once and flags repeated failures for attention."
+platforms = ["linux"]
+
+[[startup]]
+command = ["/usr/bin/python3", "bin/guard.py", "start"]
+
+[[actions]]
+id = "start"
+title = "Codex capacity guard: start"
+description = "Start the Codex capacity watcher."
+command = ["/usr/bin/python3", "bin/guard.py", "start"]
+
+[[actions]]
+id = "stop"
+title = "Codex capacity guard: stop"
+description = "Stop the background watcher."
+command = ["/usr/bin/python3", "bin/guard.py", "stop"]
+
+[[actions]]
+id = "status"
+title = "Codex capacity guard: status"
+description = "Show whether the background watcher is running."
+command = ["/usr/bin/python3", "bin/guard.py", "status"]

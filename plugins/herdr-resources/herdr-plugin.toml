@@ -5,6 +5,10 @@ min_herdr_version = "0.7.0"
 description = "Live CPU, memory, disk and Herdr Mirror status for configured dev-containers."
 platforms = ["linux"]
 
+[[startup]]
+platforms = ["linux"]
+command = ["/bin/sh", "bin/start-dashboards.sh"]
+
 [[panes]]
 id = "dashboard"
 title = "Container resources"

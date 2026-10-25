@@ -1,8 +1,8 @@
 id = "herdr.quota"
 name = "Herdr Quota"
-version = "0.2.0"
+version = "0.3.0"
 min_herdr_version = "0.7.0"
-description = "Live subscription limits for Codex, Claude, Kimi and Qwen plus DeepSeek API balance."
+description = "Live subscription limits for Codex and Claude plus DeepSeek API balance. Kimi, GLM and Qwen collectors are kept in source but disabled."
 platforms = ["linux", "macos"]
 
 [[panes]]
@@ -36,7 +36,14 @@ description = "Enter a DeepSeek key in a masked popup, validate it, and save it 
 command = ["/bin/sh", "bin/open-deepseek-config.sh"]
 
 [[actions]]
-id = "refresh-qwen"
-title = "Quota: refresh Qwen session cookies"
-description = "Open a Brave window with a debug port, log in to qwencloud.com there, and refresh the Qwen session."
-command = ["/bin/sh", "bin/refresh-qwen-cookies.sh"]
+id = "refresh-mimo"
+title = "Quota: refresh MIMO session cookies"
+description = "Open Chrome/Brave with a dedicated profile (Google OAuth accepts it), log in once, then cookies auto-renew from that profile."
+command = ["/bin/sh", "bin/refresh-mimo-cookies.sh"]
+
+# Qwen support is intentionally disabled. Keep this action in source for a possible re-enable.
+# [[actions]]
+# id = "refresh-qwen"
+# title = "Quota: refresh Qwen session cookies"
+# description = "Open a Brave window with a debug port, log in to qwencloud.com there, and refresh the Qwen session."
+# command = ["/bin/sh", "bin/refresh-qwen-cookies.sh"]

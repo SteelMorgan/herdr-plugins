@@ -6,3 +6,12 @@ __pycache__/
 
 # Local Kimi web credential; never commit browser-derived secrets.
 plugins/herdr-quota/.secrets/
+
+# Runtime/private state never belongs in source control
+.secrets/
+*.pem
+*.key
+*.log
+cache.json
+config.json
+node_modules/

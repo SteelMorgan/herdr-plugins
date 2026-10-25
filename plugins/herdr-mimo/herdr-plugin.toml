@@ -1,0 +1,55 @@
+id = "herdr.mimo"
+name = "Herdr MiMo"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "MiMo CLI actions and a MiMo TUI pane for Herdr. MVP: launch mimo in a pane, mint llm-server tokens, models/stats/diagnose."
+platforms = ["linux", "macos"]
+
+# Pane command must be absolute: the Herdr server may exec with a minimal PATH.
+[[panes]]
+id = "tui"
+title = "MiMo"
+placement = "split"
+command = ["/home/steel/.mimocode/bin/mimo"]
+
+[[actions]]
+id = "open-tui"
+title = "MiMo: open TUI pane"
+description = "Open or focus a split pane running the MiMo CLI TUI."
+command = ["/bin/sh", "bin/open-tui.sh"]
+
+[[actions]]
+id = "start-here"
+title = "MiMo: start in this pane"
+description = "Run mimo in the pane that invoked the action (falls back to the TUI pane)."
+command = ["/bin/sh", "bin/start-here.sh"]
+
+[[actions]]
+id = "llm-server-issue"
+title = "MiMo: mint llm-server token"
+description = "Issue a scoped LLM-server credential for this project and print the base URL."
+command = ["/bin/sh", "bin/llm-server-issue.sh"]
+
+[[actions]]
+id = "llm-server-list"
+title = "MiMo: list llm-server tokens"
+description = "List LLM-server tokens issued for this directory."
+command = ["/bin/sh", "bin/llm-server-list.sh"]
+
+[[actions]]
+id = "models"
+title = "MiMo: list models"
+description = "List available models for the configured providers."
+command = ["/bin/sh", "bin/models.sh"]
+
+[[actions]]
+id = "stats"
+title = "MiMo: token usage stats"
+description = "Show token usage and cost statistics."
+command = ["/bin/sh", "bin/stats.sh"]
+
+[[actions]]
+id = "diagnose"
+title = "MiMo: diagnose environment"
+description = "Check mimo binary, version, Herdr env, and CLI surface."
+command = ["/bin/sh", "bin/diagnose.sh"]

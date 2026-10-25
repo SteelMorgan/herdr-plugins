@@ -27,6 +27,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from usage_export import publish, record_failure
 
 
 ESC = "\x1b["
@@ -59,11 +60,19 @@ KIMI_WEB_BASE_URL = "https://www.kimi.com/apiv2"
 KIMI_WEB_AUTH_URL = "https://auth.kimi.com/api/account.gateway.v1.AuthService/RefreshToken"
 KIMI_WEB_STATS_URL = f"{KIMI_WEB_BASE_URL}/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats"
 KIMI_WEB_TOKEN_PATH = Path(__file__).resolve().parents[1] / ".secrets" / "kimi-web-token.json"
+CLAUDE_CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 QWEN_WEB_HOME = "https://home.qwencloud.com"
 QWEN_WEB_USER_INFO_URL = f"{QWEN_WEB_HOME}/tool/user/info.json"
 QWEN_WEB_GATEWAY_URL = f"{QWEN_WEB_HOME}/data/api.json"
 QWEN_TEAM_PRODUCT_CODE = "sfm_tokenplanteams_dp_intl"
 QWEN_WEB_SESSION_PATH = Path(__file__).resolve().parents[1] / ".secrets" / "qwen-web-session.json"
+ZAI_QUOTA_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
+DSH_CREDENTIALS_PATH = Path.home() / ".dsh" / ".credentials.yaml"
+# Z.ai reports each window as a (unit, number) pair. Only units confirmed
+# against the live API are mapped; anything else keeps a raw label and no
+# duration, so an unknown window never produces a fabricated pace.
+ZAI_UNIT_MINUTES = {3: 60, 6: 10080}
+ZAI_UNIT_NAMES = {3: "hour", 6: "week"}
 
 
 @dataclass
@@ -89,7 +98,8 @@ class Provider:
 class Store:
     def __init__(self) -> None:
         self.lock = threading.Lock()
-        self.items = {name: Provider(name) for name in ("CODEX", "CLAUDE", "KIMI", "QWEN", "DEEPSEEK API")}
+        # Kimi, GLM and Qwen collectors stay in source but are disabled in the live dashboard.
+        self.items = {name: Provider(name) for name in ("CODEX", "CLAUDE", "MIMO", "DEEPSEEK API")}
 
     def put(self, provider: Provider) -> None:
         now = time.time()
@@ -305,7 +315,34 @@ def iso_epoch(value: str | None) -> int | None:
 
 def claude_collect() -> Provider:
     """Use Claude Code's supported interactive /usage command."""
-    return usage_cli_collect("CLAUDE", "claude")
+    provider = usage_cli_collect("CLAUDE", "claude")
+    tier = claude_usage_multiplier()
+    if tier:
+        provider.plan = f"{provider.plan} {tier}".strip()
+    return provider
+
+
+def claude_usage_multiplier() -> str:
+    """Read the supported Claude account tier without exposing credentials."""
+    try:
+        payload = json.loads(CLAUDE_CREDENTIALS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+
+    oauth = payload.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return ""
+    raw_tier = oauth.get("rateLimitTier")
+    if not isinstance(raw_tier, str):
+        return ""
+
+    match = re.search(r"(?i)(?:^|[_-])(?P<suffix>5|20)x(?:$|[_-])", raw_tier)
+    if not match:
+        match = re.search(r"(?i)(?:^|[_-])x(?P<prefix>5|20)(?:$|[_-])", raw_tier)
+    if not match:
+        return ""
+    multiplier = match.group("suffix") or match.group("prefix")
+    return f"{multiplier}x"
 
 
 def parse_claude_reset(line: str, now: datetime | None = None) -> int | None:
@@ -786,8 +823,13 @@ def load_qwen_cookie() -> str | None:
     return cookie.strip() if isinstance(cookie, str) and cookie.strip() else None
 
 
-def qwen_web_sec_token(cookie: str) -> tuple[str, str | None]:
-    """Resolve the console CSRF token; returns (status, sec_token)."""
+def qwen_web_sec_token(cookie: str) -> tuple[str, str | None, str]:
+    """Resolve the console CSRF token; returns (status, sec_token, cause).
+
+    The cause is carried out verbatim: qwencloud sits behind a gateway that
+    intermittently drops TLS connections, and is_transient_error can only
+    classify that — and earn a retry — if the original text survives.
+    """
     request = urllib.request.Request(
         QWEN_WEB_USER_INFO_URL,
         headers={"Cookie": cookie, "User-Agent": "herdr-quota/0.1.0"},
@@ -795,17 +837,19 @@ def qwen_web_sec_token(cookie: str) -> tuple[str, str | None]:
     try:
         with urllib.request.urlopen(request, timeout=12) as response:
             info = json.load(response)
-    except (urllib.error.HTTPError, urllib.error.URLError, OSError, TimeoutError, ValueError):
-        return "error", None
+    except urllib.error.HTTPError as exc:
+        return "error", None, f"HTTP {exc.code}"
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+        return "error", None, str(exc)
     if not isinstance(info, dict):
-        return "error", None
+        return "error", None, "malformed console response"
     sec = (info.get("data") or {}).get("secToken")
     if info.get("code") == "ConsoleNeedLogin" or not isinstance(sec, str) or sec in ("", "0"):
-        return "expired", None
-    return "ok", sec
+        return "expired", None, ""
+    return "ok", sec, ""
 
 
-def qwen_web_post(cookie: str, sec_token: str, product: str, action: str, params: dict[str, object], region: str, language: str) -> tuple[int, object | None]:
+def qwen_web_post(cookie: str, sec_token: str, product: str, action: str, params: dict[str, object], region: str, language: str) -> tuple[int, object | None, str]:
     body = urllib.parse.urlencode({
         "product": product,
         "action": action,
@@ -826,24 +870,25 @@ def qwen_web_post(cookie: str, sec_token: str, product: str, action: str, params
     )
     try:
         with urllib.request.urlopen(request, timeout=12) as response:
-            return response.status, json.load(response)
+            return response.status, json.load(response), ""
     except urllib.error.HTTPError as exc:
-        return exc.code, None
-    except (urllib.error.URLError, OSError, TimeoutError, ValueError):
-        return 0, None
+        return exc.code, None, f"HTTP {exc.code}"
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+        return 0, None, str(exc)
 
 
 def _qwen_collect_once(cookie: str) -> Provider:
     provider = Provider("QWEN")
-    status, sec = qwen_web_sec_token(cookie)
+    status, sec, cause = qwen_web_sec_token(cookie)
     if status == "expired":
         provider.status, provider.error = "error", "session expired — run the refresh-qwen action"
         return provider
     if status == "error" or not sec:
-        provider.status, provider.error = "error", "qwencloud console unreachable"
+        provider.status = "error"
+        provider.error = f"qwencloud console unreachable: {cause}" if cause else "qwencloud console unreachable"
         return provider
 
-    code, payload = qwen_web_post(
+    code, payload, cause = qwen_web_post(
         cookie, sec, "BssOpenAPI-V3", "GetSeatSubscriptionSummary",
         {"productCode": QWEN_TEAM_PRODUCT_CODE}, "cn-hangzhou", "zh-CN",
     )
@@ -851,7 +896,8 @@ def _qwen_collect_once(cookie: str) -> Provider:
     data = data.get("Data") if isinstance(data, dict) else None
     groups = data.get("SubscriptionGroupList") if isinstance(data, dict) else None
     if code != 200 or not isinstance(data, dict) or not isinstance(groups, list) or not groups:
-        provider.status, provider.error = "error", f"seat summary unavailable (HTTP {code})"
+        provider.status = "error"
+        provider.error = "seat summary unavailable ({})".format(cause or f"HTTP {code}")
         return provider
 
     total = surplus = 0.0
@@ -944,6 +990,647 @@ def deepseek_collect() -> Provider:
     return collect_with_retry(lambda: _deepseek_collect_once(token))
 
 
+def load_zai_key() -> str | None:
+    """Prefer explicit plugin config, then the key DSH already uses for Z.ai."""
+    token = os.environ.get("ZAI_API_KEY") or load_plugin_env().get("ZAI_API_KEY")
+    if token:
+        return token
+    try:
+        for raw in DSH_CREDENTIALS_PATH.read_text(encoding="utf-8").splitlines():
+            match = re.match(r"\s+ZAI_API_KEY:\s*(\S+)", raw)
+            if match:
+                return match.group(1).strip("\"'")
+    except OSError:
+        pass
+    return None
+
+
+def zai_window_label(unit: object, number: object) -> tuple[str, int | None]:
+    """Map a Z.ai (unit, number) pair onto a dashboard label and duration."""
+    unit_minutes = ZAI_UNIT_MINUTES.get(unit) if isinstance(unit, int) else None
+    name = ZAI_UNIT_NAMES.get(unit) if isinstance(unit, int) else None
+    count = number if isinstance(number, int) and number > 0 else None
+    if not name or not unit_minutes or count is None:
+        return "quota", None
+    if name == "week" and count == 1:
+        return "weekly", unit_minutes
+    return f"{count} {name}", unit_minutes * count
+
+
+def parse_zai_percent(item: dict) -> int | None:
+    """Z.ai reports whole percents, so the 0-1 ratio heuristic must not apply."""
+    reported = parse_quota_float(item.get("percentage"))
+    if reported is not None and 0 <= reported <= 100:
+        return max(0, min(100, round(reported)))
+    used = parse_quota_int(item.get("currentValue"))
+    total = parse_quota_int(item.get("usage"))
+    if used is None or not total or total <= 0:
+        return None
+    return max(0, min(100, round(used / total * 100)))
+
+
+def parse_zai_limit(item: object) -> Window | None:
+    """Return the quota window for one Z.ai limit entry, or None when unusable."""
+    if not isinstance(item, dict):
+        return None
+    percent = parse_zai_percent(item)
+    if percent is None:
+        return None
+    label, duration = zai_window_label(item.get("unit"), item.get("number"))
+    if item.get("type") == "TIME_LIMIT" and label == "quota":
+        label = "monthly"
+    reset = item.get("nextResetTime")
+    resets_at = int(reset) // 1000 if isinstance(reset, (int, float)) and reset > 0 else None
+    return Window(label, percent, resets_at=resets_at, duration_minutes=duration)
+
+
+def _glm_collect_once(token: str) -> Provider:
+    provider = Provider("GLM")
+    request = urllib.request.Request(
+        ZAI_QUOTA_URL,
+        headers={
+            "Authorization": token,
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en",
+            "Content-Type": "application/json",
+            "User-Agent": "herdr-quota/0.3.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as exc:
+        return Provider("GLM", status="error", error=f"HTTP {exc.code}")
+    except Exception as exc:
+        return Provider("GLM", status="error", error=str(exc))
+    if not isinstance(payload, dict) or not payload.get("success"):
+        return Provider("GLM", status="error", error="quota response rejected")
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return Provider("GLM", status="error", error="quota response malformed")
+    level = data.get("level")
+    if isinstance(level, str) and level.strip():
+        provider.plan = f"coding plan {level.strip()}"
+    limits = data.get("limits")
+    for item in limits if isinstance(limits, list) else []:
+        window = parse_zai_limit(item)
+        if window:
+            provider.windows.append(window)
+    if not provider.windows:
+        provider.status = "empty"
+        provider.error = "no quota windows reported"
+        return provider
+    provider.status = "depleted" if any(w.used_percent >= 100 for w in provider.windows) else "ok"
+    return provider
+
+
+def glm_collect() -> Provider:
+    token = load_zai_key()
+    if not token:
+        return Provider(
+            "GLM",
+            status="unconfigured",
+            error="set ZAI_API_KEY in plugin config .env",
+        )
+    return collect_with_retry(lambda: _glm_collect_once(token))
+
+
+def load_mimo_key() -> str | None:
+    """Prefer plugin .env, then the MiMoCode auth store (API key, never logged)."""
+    token = os.environ.get("MIMO_API_KEY") or load_plugin_env().get("MIMO_API_KEY")
+    if token:
+        return token
+    try:
+        payload = json.loads((Path.home() / ".local" / "share" / "mimocode" / "auth.json").read_text(encoding="utf-8"))
+        entry = payload.get("xiaomi") or {}
+        key = entry.get("key")
+        return key if isinstance(key, str) and key.strip() else None
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+
+
+MIMO_WEB_SESSION_PATH = Path(__file__).resolve().parents[1] / ".secrets" / "mimo-web-session.json"
+MIMO_WEB_API = "https://platform.xiaomimimo.com/api/v1"
+# Console cookie endpoints — cache briefly so rapid refreshes do not hammer them.
+_MIMO_WEB_CACHE: dict[str, tuple[float, object]] = {}
+_MIMO_WEB_MIN_INTERVAL_SECONDS = 60.0
+
+
+def load_mimo_web_cookies() -> str | None:
+    """Browser Cookie header for platform.xiaomimimo.com (account session)."""
+    raw = os.environ.get("MIMO_WEB_COOKIES") or load_plugin_env().get("MIMO_WEB_COOKIES")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    try:
+        session = json.loads(MIMO_WEB_SESSION_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(session, dict):
+        return None
+    cookie = session.get("cookie")
+    return cookie.strip() if isinstance(cookie, str) and cookie.strip() else None
+
+
+def _mimo_web_get(path: str, cookie: str) -> object | None:
+    # Dashboard auto-refresh is 5 min; still guard bursts (manual `r` spam).
+    now = time.time()
+    cache_key = path
+    cached = _MIMO_WEB_CACHE.get(cache_key)
+    if cached and now - cached[0] < _MIMO_WEB_MIN_INTERVAL_SECONDS:
+        return cached[1]
+    request = urllib.request.Request(
+        MIMO_WEB_API + path,
+        headers={
+            "Cookie": cookie,
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) herdr-quota/0.1.0",
+            "Referer": "https://platform.xiaomimimo.com/console/usage",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            payload = json.load(response)
+    except Exception:
+        return None
+    _MIMO_WEB_CACHE[cache_key] = (now, payload)
+    return payload
+
+
+_MIMO_REFRESH_ATTEMPT = 0.0
+
+
+def mimo_try_auto_refresh() -> bool:
+    """Renew console cookies from the persistent Chrome/Brave profile (CDP).
+
+    serviceToken lives ~6h; the API wipes slh/ph on 401, so renewal must use
+    the browser profile's long-lived passToken — never Playwright (Google OAuth).
+    """
+    global _MIMO_REFRESH_ATTEMPT
+    now = time.time()
+    if now - _MIMO_REFRESH_ATTEMPT < 1800:  # at most every 30 min
+        return False
+    _MIMO_REFRESH_ATTEMPT = now
+    script = Path(__file__).resolve().parent / "refresh-mimo-cookies.sh"
+    if not script.is_file():
+        return False
+    try:
+        result = subprocess.run(
+            ["/bin/sh", str(script), "--auto"],
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def _mimo_find_used_limit(payload: object) -> tuple[float | None, float | None, int | None]:
+    """Prefer monthUsage/plan_total_token from tokenPlan/usage, else walk the tree."""
+    used = limit = reset = None
+
+    def take(obj: object) -> None:
+        nonlocal used, limit, reset
+        if not isinstance(obj, dict):
+            return
+        u = parse_quota_float(obj.get("used"))
+        lim = parse_quota_float(obj.get("limit"))
+        if u is not None and lim:
+            used, limit = u, lim
+
+    if isinstance(payload, dict):
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        month = data.get("monthUsage") if isinstance(data.get("monthUsage"), dict) else None
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else None
+        for block in (month, usage):
+            if not isinstance(block, dict):
+                continue
+            for item in block.get("items") or []:
+                if isinstance(item, dict) and str(item.get("name") or "").endswith("total_token"):
+                    take(item)
+                    if used is not None and limit:
+                        return used, limit, reset
+            if used is None:
+                # percent-only shape
+                pct = parse_quota_float(block.get("percent"))
+                if pct is not None:
+                    # API returns 0.0157 for 1.57% or 2 for 2% depending on field
+                    used = pct * 100.0 if pct <= 1 else pct
+                    limit = None
+                    return used, limit, reset
+
+    def walk(obj: object) -> None:
+        nonlocal used, limit, reset
+        if isinstance(obj, dict):
+            keys = {str(k).lower(): k for k in obj}
+            u = None
+            lim = None
+            for cand in ("usedtokens", "used_tokens", "usedtoken", "used", "consumed", "usedcount"):
+                if cand in keys and u is None:
+                    u = parse_quota_float(obj[keys[cand]])
+            for cand in ("limittokens", "limit_tokens", "totaltokens", "total_tokens", "quota", "limit", "total"):
+                if cand in keys and lim is None:
+                    lim = parse_quota_float(obj[keys[cand]])
+            if u is not None and lim:
+                used, limit = u, lim
+            for cand in ("resetat", "reset_at", "expiresat", "expires_at", "reset"):
+                if cand in keys and reset is None:
+                    reset = parse_quota_int(obj[keys[cand]])
+                    if reset and reset > 10**12:
+                        reset = reset // 1000
+            for v in obj.values():
+                walk(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                walk(v)
+
+    walk(payload)
+    return used, limit, reset
+
+
+def month_window_bounds(now: float | None = None) -> tuple[int, int]:
+    from datetime import datetime
+
+    dt = datetime.fromtimestamp(now or time.time()).astimezone()
+    start = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if start.month == 12:
+        end = start.replace(year=start.year + 1, month=1)
+    else:
+        end = start.replace(month=start.month + 1)
+    return int(start.timestamp()), int(end.timestamp())
+
+
+def week_window_bounds(now: float | None = None) -> tuple[int, int]:
+    from datetime import datetime, timedelta
+
+    dt = datetime.fromtimestamp(now or time.time()).astimezone()
+    start = (dt - timedelta(days=dt.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=7)
+    return int(start.timestamp()), int(end.timestamp())
+
+
+def _mimo_used_percent(env: dict[str, str]) -> tuple[float | None, str]:
+    raw = env.get("MIMO_MONTHLY_USED_PERCENT") or os.environ.get("MIMO_MONTHLY_USED_PERCENT")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return max(0.0, min(100.0, float(raw))), "config used-percent"
+        except ValueError:
+            pass
+    used = env.get("MIMO_MONTHLY_USED") or os.environ.get("MIMO_MONTHLY_USED")
+    limit = env.get("MIMO_MONTHLY_LIMIT") or os.environ.get("MIMO_MONTHLY_LIMIT")
+    if used is not None and limit is not None:
+        try:
+            u, lim = float(used), float(limit)
+            if lim > 0:
+                return max(0.0, min(100.0, u / lim * 100.0)), "config used/limit"
+        except ValueError:
+            pass
+    return None, ""
+
+
+def _mimo_fetch_quota(key: str) -> tuple[float | None, float | None, int | None]:
+    """Best-effort live quota (used%, limit, resets_at)."""
+    bases = (
+        "https://token-plan-sgp.xiaomimimo.com",
+        "https://platform.xiaomimimo.com",
+    )
+    paths = ("/v1/usage", "/v1/quota", "/api/v1/usage", "/api/v1/token-plan/usage")
+    headers = {"Authorization": f"Bearer {key}", "Accept": "application/json"}
+    for base in bases:
+        for path in paths:
+            request = urllib.request.Request(base + path, headers=headers)
+            try:
+                with urllib.request.urlopen(request, timeout=6) as response:
+                    payload = json.load(response)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+            used = parse_quota_float(data.get("used") or data.get("used_percent") or data.get("usedPercent"))
+            limit = parse_quota_float(data.get("limit") or data.get("total") or data.get("quota"))
+            reset = parse_quota_int(data.get("resets_at") or data.get("reset_at") or data.get("expires_at"))
+            if used is not None and limit:
+                if used > 100 and limit:
+                    used = used / limit * 100.0
+                return used, limit, reset
+            if used is not None:
+                return used, None, reset
+    return None, None, None
+
+
+
+def mimo_parse_period_end(payload: object) -> int | None:
+    """currentPeriodEnd from tokenPlan/detail → unix seconds (local)."""
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    raw = data.get("currentPeriodEnd") or data.get("current_period_end") or data.get("periodEnd")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    from datetime import datetime
+    text = raw.strip().replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return int(datetime.strptime(text[:19], fmt).timestamp())
+        except ValueError:
+            continue
+    return None
+
+
+def mimo_billing_window(period_end_ts: int) -> tuple[int, int]:
+    """
+    Billing month ≈ [end − 1 calendar month 00:00, end].
+    Period is anchored on the subscription day (e.g. 5th), not the 1st.
+    """
+    from datetime import datetime
+    end = datetime.fromtimestamp(period_end_ts)
+    if end.month == 1:
+        start = end.replace(year=end.year - 1, month=12, hour=0, minute=0, second=0, microsecond=0)
+    else:
+        start = end.replace(month=end.month - 1, hour=0, minute=0, second=0, microsecond=0)
+    return int(start.timestamp()), period_end_ts
+
+
+def mimo_week_index(period_start_ts: int, now: float | None = None) -> tuple[int, int, int]:
+    """0-based completed weeks, current week 1-based, week_start ts."""
+    now_ts = int(now or time.time())
+    elapsed = max(0, now_ts - period_start_ts)
+    completed = elapsed // (7 * 24 * 3600)
+    week_start = period_start_ts + completed * 7 * 24 * 3600
+    return int(completed), int(completed) + 1, week_start
+
+
+def mimo_week_state_path() -> Path:
+    config_dir = os.environ.get("HERDR_PLUGIN_CONFIG_DIR")
+    if config_dir:
+        return Path(config_dir) / "mimo-week-state.json"
+    return Path.home() / ".config" / "herdr" / "plugins" / "config" / "herdr.quota" / "mimo-week-state.json"
+
+
+def _mimo_last_period_end() -> int | None:
+    try:
+        state = json.loads(mimo_week_state_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return parse_quota_int(state.get("period_end_ts"))
+
+
+def _mimo_save_env_snapshot(used_abs: float, limit: float) -> None:
+    """Keep .env fallback in sync so a dead cookie still shows recent numbers."""
+    path = plugin_config_path()
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    except OSError:
+        return
+    out: list[str] = []
+    seen_used = seen_limit = False
+    for line in lines:
+        if line.startswith("MIMO_MONTHLY_USED="):
+            out.append(f"MIMO_MONTHLY_USED={int(used_abs)}")
+            seen_used = True
+        elif line.startswith("MIMO_MONTHLY_LIMIT="):
+            out.append(f"MIMO_MONTHLY_LIMIT={int(limit)}")
+            seen_limit = True
+        elif line.startswith("MIMO_MONTHLY_USED_PERCENT="):
+            continue
+        else:
+            out.append(line)
+    if not seen_used:
+        out.append(f"MIMO_MONTHLY_USED={int(used_abs)}")
+    if not seen_limit:
+        out.append(f"MIMO_MONTHLY_LIMIT={int(limit)}")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(out) + "\n", encoding="utf-8")
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def mimo_week_percent(used_abs: float, limit: float, period_end_ts: int | None = None, now: float | None = None) -> tuple[int, str]:
+    """
+    Weekly bar against this week's *effective* budget (limit/4).
+
+    Pool model (billing cycle, not calendar month):
+      W = limit/4
+      carry = net credit at end of previous week (+ under-spend, − over-spend)
+      budget   = W + max(0, carry)          # unused rolls forward (bigger base)
+      consumed = week_spent + max(0, -carry)  # debt starts the week pre-spent
+      week%    = consumed / budget * 100    # may exceed 100
+
+    Week 1 spent 30B of W=20.5B → 146%. Week 2 then starts at 46% (9.5B debt).
+    Week 1 spent 10B → week 2 budget is 31B (unused 10.5B rolled).
+    """
+    if not limit or limit <= 0:
+        return 0, "no-limit"
+    W = limit / 4.0
+    now_ts = now or time.time()
+
+    if period_end_ts:
+        period_start, _period_end = mimo_billing_window(period_end_ts)
+    else:
+        period_start, _ = month_window_bounds(now)
+
+    completed, week_no, _week_start_ts = mimo_week_index(period_start, now_ts)
+    path = mimo_week_state_path()
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        state = {}
+
+    prev_period = parse_quota_int(state.get("period_end_ts"))
+    prev_week = parse_quota_int(state.get("week_no"))
+    last_used = parse_quota_float(state.get("last_used"))
+    week_start_used = parse_quota_float(state.get("week_start_used"))
+    carry = parse_quota_float(state.get("carry")) or 0.0
+
+    period_changed = bool(prev_period and period_end_ts and prev_period != period_end_ts)
+    reset_period = period_changed or (last_used is not None and used_abs + 1 < last_used)
+
+    if reset_period:
+        carry = 0.0
+        week_start_used = used_abs  # spend before this week does not count
+        prev_week = week_no
+    elif week_start_used is None:
+        # First sample ever: week 1 — all spend so far is this week.
+        # Later weeks: do not invent week history; start the week at current total
+        # only if we have no prior sample (else keep last_used as baseline).
+        if week_no <= 1:
+            week_start_used = 0.0
+        else:
+            week_start_used = last_used if last_used is not None else 0.0
+
+    # Close week(s) that ended since the last sample.
+    if prev_week is not None and week_no > prev_week:
+        closed_spent = max(0.0, used_abs - (week_start_used if week_start_used is not None else 0.0))
+        # One W per closed week (assume only the latest boundary matters if we missed samples).
+        weeks_closed = max(1, week_no - prev_week)
+        # Grant W for each closed week against that week's spend (approximate with
+        # all closed_spent attributed to the last closed week — good enough if
+        # samples are frequent).
+        carry = carry + W * weeks_closed - closed_spent
+        week_start_used = used_abs
+
+    if week_start_used is None:
+        week_start_used = 0.0
+
+    week_spent = max(0.0, used_abs - week_start_used)
+    budget = W + max(0.0, carry)
+    consumed = week_spent + max(0.0, -carry)
+    percent = int(round(consumed / budget * 100.0)) if budget > 0 else 0
+    method = f"w{week_no} carry={carry/1e9:.2f}B spent={week_spent/1e9:.2f}B"
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "period_end_ts": period_end_ts if period_end_ts is not None else prev_period,
+                    "period_start_ts": period_start,
+                    "week_no": week_no,
+                    "week_start_used": week_start_used,
+                    "last_used": used_abs,
+                    "carry": carry,
+                    "week_spent": week_spent,
+                    "week_consumed": consumed,
+                    "week_budget": budget,
+                    "updated_at": time.time(),
+                    "method": method,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return percent, method
+
+
+def mimo_collect() -> Provider:
+    """MiMo Token Plan is monthly; weekly row uses month/4 for habit."""
+    provider = Provider("MIMO")
+    env = load_plugin_env()
+    key = load_mimo_key()
+    cookies = load_mimo_web_cookies()
+    if not cookies and not key and not env.get("MIMO_MONTHLY_USED_PERCENT") and not env.get("MIMO_MONTHLY_LIMIT"):
+        provider.status = "unconfigured"
+        provider.error = "run capture-mimo-cookies or set MIMO_MONTHLY_* in .env"
+        return provider
+
+    used = None
+    used_abs = None
+    source = ""
+    limit = None
+    resets_at = None
+
+    # Live console session (cookie) is the primary source — tokens move continuously.
+    period_end_ts = None
+    if cookies:
+        usage_payload = _mimo_web_get("/tokenPlan/usage", cookies)
+        detail_payload = _mimo_web_get("/tokenPlan/detail", cookies)
+        if usage_payload is None and detail_payload is None:
+            # Session dead or network blip — try a silent profile refresh once.
+            if mimo_try_auto_refresh():
+                cookies = load_mimo_web_cookies()
+                _MIMO_WEB_CACHE.clear()
+                if cookies:
+                    usage_payload = _mimo_web_get("/tokenPlan/usage", cookies)
+                    detail_payload = _mimo_web_get("/tokenPlan/detail", cookies)
+        if detail_payload is not None:
+            period_end_ts = mimo_parse_period_end(detail_payload)
+        if usage_payload is not None:
+            live_used, live_limit, live_reset = _mimo_find_used_limit(usage_payload)
+            if live_used is not None and live_limit:
+                used_abs = float(live_used)
+                used = max(0.0, min(100.0, live_used / live_limit * 100.0))
+                limit = live_limit
+                resets_at = live_reset or period_end_ts
+                source = "web"
+            elif live_used is not None and live_used <= 100 and live_limit is None:
+                used = max(0.0, min(100.0, float(live_used)))
+                source = "web%"
+    # Keep the last known billing window — a 401 must not drop us onto calendar month.
+    if period_end_ts is None:
+        period_end_ts = parse_quota_int(_mimo_last_period_end())
+
+    if used is None:
+        used, cfg_src = _mimo_used_percent(env)
+        if used is not None:
+            source = cfg_src
+    if used is None and key:
+        live_used, live_limit, live_reset = _mimo_fetch_quota(key)
+        if live_used is not None:
+            used = max(0.0, min(100.0, float(live_used)))
+            limit = live_limit
+            resets_at = live_reset
+            source = "api"
+    if used is None:
+        provider.status = "unconfigured" if not cookies else "error"
+        provider.error = (
+            "session expired — run refresh-mimo-cookies (Google OAuth in the opened Chrome)"
+            if cookies
+            else "run refresh-mimo-cookies or set MIMO_MONTHLY_* in .env"
+        )
+        return provider
+
+    used_i = int(round(used))
+    if limit is None:
+        limit_raw = env.get("MIMO_MONTHLY_LIMIT") or os.environ.get("MIMO_MONTHLY_LIMIT")
+        if limit_raw:
+            limit = parse_quota_float(limit_raw)
+    if used_abs is None and limit is not None:
+        used_abs = (used / 100.0) * float(limit)
+    if source == "web" and used_abs is not None and limit:
+        _mimo_save_env_snapshot(used_abs, float(limit))
+    month_start, month_end = month_window_bounds()
+    week_start, week_end = week_window_bounds()
+    if resets_at is None:
+        resets_at = month_end
+
+    # weekly % vs this week's effective budget (limit/4 + carry/−debt).
+    if used_abs is not None and limit:
+        week_pct, week_method = mimo_week_percent(used_abs, float(limit), period_end_ts)
+    else:
+        week_pct, week_method = used_i, "monthly"
+    # Billing-week reset when we know the period; else ISO week.
+    if period_end_ts:
+        _ps, week_no_cur = mimo_billing_window(period_end_ts)[0], mimo_week_index(mimo_billing_window(period_end_ts)[0])[1]
+        _completed, _wn, w_start = mimo_week_index(mimo_billing_window(period_end_ts)[0])
+        w_end = w_start + 7 * 24 * 3600
+        week_reset_ts = w_end
+        week_dur = 7 * 24 * 60
+    else:
+        week_reset_ts = week_end
+        week_dur = (week_end - week_start) // 60
+    provider.windows.append(Window("weekly", week_pct, week_reset_ts, week_dur))
+    provider.windows.append(Window("monthly", used_i, resets_at or (period_end_ts or month_end), (month_end - month_start) // 60))
+    if limit is not None:
+        def _fmt_tokens(n: float) -> str:
+            if n >= 1e9:
+                v = n / 1e9
+                return f"{v:.2f}B" if abs(v - round(v)) >= 0.01 else f"{v:.0f}B"
+            if n >= 1e6:
+                v = n / 1e6
+                return f"{v:.1f}M" if abs(v - round(v)) >= 0.01 else f"{v:.0f}M"
+            if n >= 1e3:
+                return f"{n / 1e3:.1f}K"
+            return f"{n:g}"
+
+        week_limit = limit / 4.0
+        used_abs = (used / 100.0) * limit
+        # Compact: fits the dashboard row without truncation. Week = month/4 is
+        # the weekly window below; only the numbers live on this line.
+        provider.plan = f"{_fmt_tokens(used_abs)}/{_fmt_tokens(limit)} · week {_fmt_tokens(week_limit)}"
+    else:
+        tag = f" · {source}" if source else ""
+        provider.plan = f"token plan · weekly budget = monthly/4{tag}"
+    provider.status = "depleted" if used_i >= 100 else "ok"
+    return provider
+
+
 def bar(percent: int, width: int) -> str:
     width = max(1, width)
     filled = round(width * max(0, min(100, percent)) / 100)
@@ -1001,7 +1688,8 @@ def render(store: Store, refreshing: bool) -> tuple[int, int, int] | None:
         if provider.plan:
             content = f"plan  {provider.plan}"
             lines.append("│ " + TEXT + truncate(content, inner).ljust(inner) + MUTED + " │")
-        window_order = {"monthly": 0, "weekly": 1, "5 hour": 2, "5 day": 3}
+        # Weekly first (habit); MiMo weekly is derived as month/4.
+        window_order = {"weekly": 0, "monthly": 1, "5 hour": 2, "5 day": 3}
         ordered_windows = sorted(provider.windows, key=lambda window: (window_order.get(window.label, 4), window.label))
         for window in ordered_windows[:3]:
             compact = inner < 35
@@ -1076,8 +1764,10 @@ def refresh(store: Store, flag: list[bool]) -> None:
     collectors = (
         codex_collect,
         claude_collect,
-        kimi_collect,
-        qwen_collect,
+        mimo_collect,
+        # kimi_collect,  # Disabled while this subscription is not monitored.
+        # qwen_collect,  # Intentionally disabled; keep the implementation for a possible re-enable.
+        # glm_collect,  # Disabled while this subscription is not monitored.
         deepseek_collect,
     )
     threads = []
@@ -1089,6 +1779,11 @@ def refresh(store: Store, flag: list[bool]) -> None:
             time.sleep(COLLECTOR_STAGGER_SECONDS)
     for thread in threads:
         thread.join(timeout=COLLECTOR_JOIN_TIMEOUT_SECONDS)
+    try:
+        publish(store.snapshot())
+    except Exception:
+        # Export failures must not stop quota collection or expose raw errors.
+        record_failure()
     flag[0] = False
 
 
@@ -1097,8 +1792,9 @@ def diagnose() -> int:
     checks = {
         "codex": find_binary("codex") or "missing",
         "claude": find_binary("claude") or "missing",
-        "kimi": find_binary("kimi") or "missing",
-        "qwen_session": "configured" if load_qwen_cookie() else "missing",
+        "mimo_cookie": "configured" if load_mimo_web_cookies() else "missing",
+        "mimo_key": "configured" if (os.environ.get("MIMO_API_KEY") or load_plugin_env().get("MIMO_API_KEY") or load_mimo_key()) else "missing",
+        "mimo_monthly": load_plugin_env().get("MIMO_MONTHLY_USED_PERCENT") or os.environ.get("MIMO_MONTHLY_USED_PERCENT") or "unset",
         "deepseek_key": "configured" if os.environ.get("DEEPSEEK_API_KEY") or env.get("DEEPSEEK_API_KEY") else "missing",
         "plugin_config": os.environ.get("HERDR_PLUGIN_CONFIG_DIR", "not provided"),
     }

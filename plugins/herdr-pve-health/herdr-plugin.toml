@@ -1,0 +1,20 @@
+id = "herdr.pve-health"
+name = "Dev Server Health"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Low-frequency read-only Proxmox/SMART/VM/backup health over SSH."
+platforms = ["linux"]
+
+[[startup]]
+command = ["/bin/sh", "/home/steel/projects/herdr-plugins/plugins/herdr-resources/bin/start-dashboards.sh"]
+
+[[panes]]
+id = "dashboard"
+title = "Dev server health"
+placement = "split"
+command = ["/bin/sh", "-c", "exec /usr/bin/python3 \"$HERDR_PLUGIN_ROOT/bin/dashboard.py\""]
+
+[[actions]]
+id = "diagnose"
+title = "Dev server: collect health once"
+command = ["/bin/sh", "-c", "exec /usr/bin/python3 \"$HERDR_PLUGIN_ROOT/bin/dashboard.py\" --diagnose"]

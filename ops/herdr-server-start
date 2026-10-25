@@ -1,0 +1,38 @@
+#!/bin/sh
+# Start the local herdr server with stdout/stderr captured to a file.
+# When the herdr client autospawns the server it sends both streams to
+# /dev/null, so a crash (panic, abort) leaves no trace in herdr-server.log.
+# Starting the server first makes the client attach to it instead.
+# No-op if a server is already running.
+
+HERDR=/home/steel/.local/bin/herdr
+LOG_DIR="$HOME/.config/herdr"
+OUT="$LOG_DIR/herdr-server.stderr.log"
+MAX_BYTES=10485760
+
+running() {
+    "$HERDR" status --json 2>/dev/null | grep -q '"server":{"status":"running"'
+}
+
+running && exit 0
+
+# Keep one previous file when the log grows too large.
+if [ -f "$OUT" ] && [ "$(stat -c %s "$OUT")" -gt "$MAX_BYTES" ]; then
+    mv -f "$OUT" "$OUT.1"
+fi
+
+# Shared D-Bus session bus for the server and everything it spawns.
+[ -f "$HOME/.config/session-bus.sh" ] && . "$HOME/.config/session-bus.sh"
+
+printf '=== %s herdr server start\n' "$(date -Is)" >>"$OUT"
+RUST_BACKTRACE=1 setsid "$HERDR" server </dev/null >>"$OUT" 2>&1 &
+
+# Wait for the socket so the client attaches rather than spawning its own.
+i=0
+while [ "$i" -lt 50 ]; do
+    running && exit 0
+    i=$((i + 1))
+    sleep 0.2
+done
+echo "herdr-server-start: server did not become ready, see $OUT" >&2
+exit 1

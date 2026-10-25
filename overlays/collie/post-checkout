@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+root=$(git rev-parse --show-toplevel)
+python3 /home/steel/.config/herdr/plugins/config/herdr.collie/local-overrides/apply.py "$root"

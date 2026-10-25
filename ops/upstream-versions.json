@@ -1,0 +1,18 @@
+{
+  "herdr": {
+    "upstream": "https://github.com/herdrdev/herdr.git",
+    "revision": "92f225704a6c27647464ebe1b5f4f6f1cd3f5d2b"
+  },
+  "herdr-extensions": {
+    "upstream": "https://github.com/vonzelle-vzt/herdr-extensions.git",
+    "revision": "192ff2eb151f336e1aba7d0e8bab71576a67e3ae"
+  },
+  "herdr-mirror": {
+    "upstream": "https://github.com/nikok6/herdr-mirror.git",
+    "revision": "195398c1275f9f3d18ddff70282149005a2bec01"
+  },
+  "collie": {
+    "upstream": "https://github.com/AltanS/collie.git",
+    "revision": "8c4c0d4f969da9e226933504f4ae79219916196a"
+  }
+}

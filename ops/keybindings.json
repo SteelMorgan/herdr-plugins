@@ -1,0 +1,102 @@
+[
+  {
+    "key": "prefix+shift+c",
+    "type": "plugin_action",
+    "command": "persiyanov.reviewr.toggle"
+  },
+  {
+    "key": "prefix+shift+e",
+    "type": "shell",
+    "command": "/home/steel/.local/bin/herdr plugin action invoke open-editor --plugin herdr-extensions"
+  },
+  {
+    "key": "prefix+shift+o",
+    "type": "shell",
+    "command": "/home/steel/.local/bin/herdr plugin action invoke open-editor-tab --plugin herdr-extensions"
+  },
+  {
+    "key": "prefix+shift+s",
+    "type": "shell",
+    "command": "/home/steel/.local/bin/herdr plugin action invoke open-git --plugin herdr-extensions"
+  },
+  {
+    "key": "prefix+shift+m",
+    "type": "shell",
+    "command": "/home/steel/.local/bin/herdr plugin action invoke open-problems --plugin herdr-extensions"
+  },
+  {
+    "key": "prefix+shift+f",
+    "type": "shell",
+    "command": "/home/steel/.local/bin/herdr plugin action invoke open-search --plugin herdr-extensions"
+  },
+  {
+    "key": "prefix+t",
+    "type": "shell",
+    "command": "/home/steel/.local/bin/herdr plugin action invoke open-todo --plugin herdr-extensions"
+  },
+  {
+    "key": "prefix+shift+b",
+    "type": "shell",
+    "command": "/home/steel/.local/bin/herdr plugin action invoke open-blame --plugin herdr-extensions"
+  },
+  {
+    "key": "prefix+shift+v",
+    "type": "shell",
+    "command": "/home/steel/.local/bin/herdr plugin action invoke open-markdown --plugin herdr-extensions"
+  },
+  {
+    "key": "prefix+d",
+    "type": "shell",
+    "command": "/home/steel/.local/bin/herdr plugin action invoke open-debug --plugin herdr-extensions"
+  },
+  {
+    "key": "prefix+shift+u",
+    "type": "shell",
+    "command": "/home/steel/.local/bin/herdr plugin action invoke open-tests --plugin herdr-extensions"
+  },
+  {
+    "key": "prefix+shift+a",
+    "type": "shell",
+    "command": "/home/steel/.local/bin/herdr plugin action invoke open-preview --plugin herdr-extensions"
+  },
+  {
+    "key": "prefix+i",
+    "type": "shell",
+    "command": "/home/steel/.local/bin/herdr plugin action invoke paste-image --plugin herdr-extensions"
+  },
+  {
+    "key": "prefix+shift+j",
+    "type": "shell",
+    "command": "/home/steel/.local/bin/herdr plugin action invoke open-project --plugin herdr-extensions"
+  },
+  {
+    "key": "prefix+shift+i",
+    "type": "shell",
+    "command": "/home/steel/.local/bin/herdr plugin action invoke open-images --plugin herdr-extensions"
+  },
+  {
+    "key": "prefix+shift+k",
+    "type": "shell",
+    "command": "/home/steel/.local/bin/herdr plugin action invoke open-review --plugin herdr-extensions"
+  },
+  {
+    "key": "prefix+shift+y",
+    "type": "shell",
+    "command": "/home/steel/.local/bin/herdr plugin action invoke open-conflicts --plugin herdr-extensions"
+  },
+  {
+    "key": "prefix+shift+l",
+    "type": "shell",
+    "command": "/home/steel/.local/bin/herdr plugin action invoke resize-wider --plugin herdr-extensions"
+  },
+  {
+    "key": "prefix+shift+h",
+    "type": "shell",
+    "command": "/home/steel/.local/bin/herdr plugin action invoke resize-narrower --plugin herdr-extensions"
+  },
+  {
+    "key": "prefix+shift+z",
+    "type": "shell",
+    "command": "/home/steel/.local/bin/herdr plugin action invoke open-spaces --plugin herdr-extensions"
+  }
+]

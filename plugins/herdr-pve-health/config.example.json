@@ -1,0 +1,17 @@
+{
+  "ssh_config": "~/.ssh/config",
+  "hosts": {
+    "pve": "gbig-pve",
+    "agents": "gbig-agents",
+    "vpn": "gbig-vpn",
+    "onec": "gbig-1c-app"
+  },
+  "windows_backup_file": "/mnt/d/Backups/Proxmox/last-success.json",
+  "tcp_checks": [["1C TCP", "192.0.2.10", 1541]],
+  "https_check": {
+    "address": "192.0.2.20",
+    "hostname": "dev.example.com",
+    "expected_status": 404
+  },
+  "dns_check": "example.com"
+}

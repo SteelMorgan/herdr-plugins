@@ -1,0 +1,28 @@
+[Unit]
+Description=Herdr agent workspace (VPN-only network)
+Requires=gbig-vpnonly-network.service
+After=gbig-vpnonly-network.service gbig-egress.service
+
+[Service]
+Type=simple
+User=hermes
+Group=hermes
+WorkingDirectory=/home/hermes
+NetworkNamespacePath=/run/netns/gbig-vpnonly
+Environment=PATH=/home/hermes/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HTTP_PROXY=http://10.77.50.1:1080
+Environment=HTTPS_PROXY=http://10.77.50.1:1080
+Environment=http_proxy=http://10.77.50.1:1080
+Environment=https_proxy=http://10.77.50.1:1080
+Environment=ALL_PROXY=socks5h://10.77.50.1:1080
+Environment=all_proxy=socks5h://10.77.50.1:1080
+Environment=NO_PROXY=localhost,127.0.0.1
+Environment=no_proxy=localhost,127.0.0.1
+Environment=NODE_USE_ENV_PROXY=1
+ExecStart=/usr/local/bin/herdr server
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
