@@ -1,8 +1,8 @@
 id = "herdr.codex-capacity-guard"
-name = "Herdr Codex Capacity Guard"
-version = "0.1.0"
+name = "Herdr Agent Guard"
+version = "0.3.0"
 min_herdr_version = "0.9.0"
-description = "Retries a Codex capacity error once and flags repeated failures for attention."
+description = "Retries Codex capacity errors and DSH TUI overload turn errors while the agent is idle."
 platforms = ["linux"]
 
 [[startup]]
@@ -10,18 +10,18 @@ command = ["/usr/bin/python3", "bin/guard.py", "start"]
 
 [[actions]]
 id = "start"
-title = "Codex capacity guard: start"
-description = "Start the Codex capacity watcher."
+title = "Agent guard: start"
+description = "Start the capacity and turn-error watcher."
 command = ["/usr/bin/python3", "bin/guard.py", "start"]
 
 [[actions]]
 id = "stop"
-title = "Codex capacity guard: stop"
+title = "Agent guard: stop"
 description = "Stop the background watcher."
 command = ["/usr/bin/python3", "bin/guard.py", "stop"]
 
 [[actions]]
 id = "status"
-title = "Codex capacity guard: status"
+title = "Agent guard: status"
 description = "Show whether the background watcher is running."
 command = ["/usr/bin/python3", "bin/guard.py", "status"]

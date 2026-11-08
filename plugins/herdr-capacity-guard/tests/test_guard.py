@@ -30,6 +30,14 @@ class PaneStateTests(unittest.TestCase):
 
 
 class CapacityHandlingTests(unittest.TestCase):
+    def setUp(self):
+        status = patch.object(guard, "_codex_status_for_pane", return_value="idle")
+        status.start()
+        self.addCleanup(status.stop)
+        read = patch.object(guard, "read_pane_text", return_value=guard.CAPACITY_ERROR)
+        read.start()
+        self.addCleanup(read.stop)
+
     def test_first_capacity_error_sends_immediately(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ, {"HERDR_PLUGIN_STATE_DIR": directory}
@@ -143,7 +151,8 @@ class CapacityHandlingTests(unittest.TestCase):
 
             with (
                 patch.object(guard.time, "time", return_value=1000.0),
-                patch.object(guard, "_codex_status_for_pane", return_value="working"),
+                patch.object(guard, "_codex_status_for_pane", return_value="idle"),
+                patch.object(guard, "read_pane_text", return_value=guard.CAPACITY_ERROR),
                 patch.object(guard, "send_continuation", return_value="agent API"),
                 patch.object(guard, "api_request", side_effect=fake_api_request),
             ):
@@ -208,6 +217,38 @@ class CapacityHandlingTests(unittest.TestCase):
             )
             self.assertFalse(any(method == "notification.show" for method, _ in calls))
 
+    def test_docker_mirror_uses_remote_agent_api(self):
+        route = ('docker', '1c-ai-sandbox', ['/usr/sbin/runuser', '-u', 'vscode', '--', '/home/vscode/.local/bin/herdr'], 'w1:pCC')
+        info = {'result': {'process_info': {'foreground_processes': [{'argv': ['/opt/herdr-mirror', 'pane', '1c-ai-sandbox', 'w1:pCC', '--remote-bin', '/usr/sbin/runuser -u vscode -- /home/vscode/.local/bin/herdr', '--container', '1c-ai-sandbox', '--docker-bin', 'docker']}]}}}
+        self.assertEqual(guard.docker_mirror_route.__name__, 'docker_mirror_route')
+        def api(method, params):
+            if method == 'agent.prompt': raise RuntimeError('agent_not_ready: mirrored foreground')
+            if method == 'agent.list': return {'result': {'agents': [{'pane_id': 'w12:p9V', 'agent': 'codex'}]}}
+            if method == 'pane.process_info': return info
+            raise AssertionError(method)
+        outputs = [
+            subprocess.CompletedProcess([], 0, json.dumps({'result': {'agents': [{'pane_id': 'w1:pCC', 'agent': 'codex', 'agent_status': 'done'}]}}), ''),
+            subprocess.CompletedProcess([], 0, json.dumps({'result': {'type': 'agent_prompted'}}), ''),
+        ]
+        with patch.object(guard, 'api_request', side_effect=api), patch.object(guard.subprocess, 'run', side_effect=outputs) as run:
+            self.assertEqual(guard.send_continuation('w12:p9V'), 'remote Docker agent API')
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args_list[0].args[0], [*route[:1], 'exec', route[1], *route[2], 'agent', 'list'])
+        self.assertEqual(run.call_args_list[1].args[0][-4:], ['agent', 'prompt', 'w1:pCC', 'Продолжить'])
+
+    def test_docker_mirror_never_sends_to_working_agent(self):
+        output = subprocess.CompletedProcess([], 0, json.dumps({'result': {'agents': [{'pane_id': 'w1:pCC', 'agent': 'codex', 'agent_status': 'working'}]}}), '')
+        with patch.object(guard.subprocess, 'run', return_value=output) as run:
+            with self.assertRaisesRegex(RuntimeError, 'not a ready Codex'):
+                guard.send_docker_mirror(('docker', '1c-ai-sandbox', ['herdr'], 'w1:pCC'))
+        self.assertEqual(run.call_count, 1)
+
+    def test_docker_mirror_failure_never_falls_back_to_terminal(self):
+        with patch.object(guard, 'api_request', side_effect=[RuntimeError('agent_not_ready: mirror'), {'result': {'agents': [{'pane_id': 'w1:p1', 'agent': 'codex'}]}}]), patch.object(guard, 'docker_mirror_route', return_value=('docker', 'box', ['herdr'], 'w1:p1')), patch.object(guard, 'send_docker_mirror', side_effect=RuntimeError('timeout')), patch.object(guard.subprocess, 'run') as run:
+            with self.assertRaisesRegex(RuntimeError, 'timeout'):
+                guard.send_continuation('w1:p1')
+        run.assert_not_called()
+
     def test_failed_mirror_send_marks_pane_for_attention(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ, {"HERDR_PLUGIN_STATE_DIR": directory}
@@ -268,9 +309,8 @@ class CapacityHandlingTests(unittest.TestCase):
             guard.set_pane_state("w1:p1", {"phase": "cooldown", "retry_at": 1000.0})
             with (
                 patch.object(guard.time, "time", return_value=1000.0),
-                patch.object(guard, "agents_snapshot", return_value=[
-                    {"pane_id": "w1:p1", "agent": "codex", "agent_status": "done"}
-                ]),
+                patch.object(guard, "_codex_status_for_pane", return_value="done"),
+                patch.object(guard, "read_pane_text", return_value="• Task finished"),
                 patch.object(guard, "send_continuation") as send,
                 patch.object(guard, "api_request") as request,
             ):
@@ -289,7 +329,7 @@ class CapacityHandlingTests(unittest.TestCase):
     def test_completed_agent_clears_pending_retry(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ, {"HERDR_PLUGIN_STATE_DIR": directory}
-        ), patch.object(guard, "api_request") as request:
+        ), patch.object(guard, "api_request") as request, patch.object(guard, "read_pane_text", return_value="• Task finished"):
             guard.set_pane_state("w1:p1", {"phase": "cooldown", "retry_at": 1000.0})
             guard.process_agent_status("w1:p1", "done")
 
