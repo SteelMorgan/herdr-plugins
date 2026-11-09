@@ -38,6 +38,15 @@ def turn_tail(error: bool = True) -> str:
     )
 
 
+def api_error_tail() -> str:
+    """DSH divider for a provider API failure, e.g. kimi-token-plan 400."""
+    return turn_tail().replace(
+        "The engine is currently overloaded, please try again later",
+        'kimi-token-plan API error (400): {"code":"invalid_request_error",'
+        '"message":"Invalid request: tokenization failed","type":"invalid_request_error"}',
+    )
+
+
 def dsh_agent(status: str = "idle") -> dict:
     return {"pane_id": "wZ:p1Z5", "agent": "dsh-tui", "agent_status": status}
 
@@ -45,6 +54,9 @@ def dsh_agent(status: str = "idle") -> dict:
 class TurnErrorDetectionTests(unittest.TestCase):
     def test_current_turn_error_is_recognized(self):
         self.assertIsNotNone(guard.recent_turn_error(turn_tail()))
+
+    def test_kimi_token_plan_api_error_is_recognized(self):
+        self.assertIsNotNone(guard.recent_turn_error(api_error_tail()))
 
     def test_later_activity_makes_the_error_stale(self):
         self.assertIsNone(guard.recent_turn_error(turn_tail() + "\n⚓ Thinking · 1s\n"))
@@ -103,6 +115,23 @@ class TurnErrorHandlingTests(unittest.TestCase):
         state = guard.get_pane_state("wZ:p1Z5")
         self.assertEqual(state["phase"], "turn_cooldown")
         self.assertEqual(state["retry_at"], 1000.0 + guard.RETRY_DELAY_SECONDS)
+
+    def test_kimi_api_error_sends_continue_and_starts_cooldown(self):
+        calls = []
+
+        def fake_send(pane_id, expected_kind="codex"):
+            calls.append((pane_id, expected_kind))
+            return "agent API"
+
+        with (
+            patch.object(guard.time, "time", return_value=1000.0),
+            patch.object(guard, "send_continuation", side_effect=fake_send),
+            patch.object(guard, "api_request"),
+        ):
+            guard.handle_turn_error("wZ:p1Z5", "turn error", api_error_tail())
+
+        self.assertEqual(calls, [("wZ:p1Z5", "dsh-tui")])
+        self.assertEqual(guard.get_pane_state("wZ:p1Z5")["phase"], "turn_cooldown")
 
     def test_duplicate_turn_error_during_cooldown_does_not_send_again(self):
         guard.set_pane_state(

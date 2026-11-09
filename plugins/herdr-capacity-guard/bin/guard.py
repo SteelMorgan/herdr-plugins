@@ -25,6 +25,10 @@ COMPACT_STREAM_ERROR = "Error running remote compact task: stream disconnected b
 RETRY_ERRORS = (CAPACITY_ERROR, COMPACT_STREAM_ERROR)
 TURN_ERROR_MARKER = "turn error"
 TURN_ERROR_DETAIL = "The engine is currently overloaded"
+# Provider-side turn failures render like
+# ``turn error · kimi-token-plan API error (400): {...}``; they are transient
+# for the retry flow just like the overloaded-engine divider.
+TURN_ERROR_API_ERROR = re.compile(r"apierror\(\d{3}\):")
 DSH_TUI_AGENT = "dsh-tui"
 WATCHED_AGENTS = ("codex", DSH_TUI_AGENT)
 RETRY_TEXT = "Продолжить"
@@ -506,7 +510,7 @@ def recent_turn_error(text: str) -> str | None:
 
     detail = compact(TURN_ERROR_DETAIL)
     window = "".join(compact(line) for line in lines[found:found + 4])
-    if detail not in window:
+    if detail not in window and not TURN_ERROR_API_ERROR.search(window):
         return None
 
     # A later transcript row means this error is no longer the latest turn.

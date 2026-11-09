@@ -9,9 +9,11 @@ Codex matches the exact messages
 `Selected model is at capacity. Please try a different model.` and
 `Error running remote compact task: stream disconnected before completion:`.
 DSH TUI matches the current divider
-`turn error · The engine is currently overloaded, please try again later`.
-Other turn errors (authentication, invalid request, cancelled turns) are not
-retried automatically.
+`turn error · The engine is currently overloaded, please try again later`
+or a provider API failure such as
+`turn error · kimi-token-plan API error (400): ...`.
+Other turn errors (authentication, cancelled turns) are not retried
+automatically.
 
 Every five seconds, and on `idle`/`done` lifecycle events, the guard checks the
 last eight terminal message blocks within the last 240 rows. A later subagent
@@ -79,8 +81,9 @@ directory so a restart resumes a pending ten-minute timer.
 ## Safety limits
 
 - Only the exact capacity messages, the specific remote compact stream-error
-  prefix, or the DSH overload `turn error` divider triggers a retry; unrelated
-  stream, transport, authentication or validation errors do not.
+  prefix, the DSH overload `turn error` divider, or a DSH provider
+  `API error (NNN):` divider triggers a retry; unrelated stream, transport,
+  authentication or cancelled-turn errors do not.
 - Only panes whose recognized agent is `codex` or `dsh-tui` are watched.
 - The first `Продолжить` is immediate; ten minutes starts only after the error
   returns or remains unresolved after that prompt.
