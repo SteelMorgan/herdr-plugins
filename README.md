@@ -37,3 +37,13 @@ python3 -m unittest discover -s plugins/herdr-capacity-guard/tests -v
 
 Dashboard health probes are read-only; usage publication and cookie refresh are
 separate explicitly configured features. Read each component README before use.
+
+## Herdr App instance
+
+[`app/`](app/) is the second instance of these plugins for the **Herdr App**
+(desktop `herdr-app` + herdr-core `hc`), kept alongside the TUI version. The
+plugin logic is preserved; only the runtime integration differs (mods instead
+of plugin manifests, `hc`/`herdr-app` instead of the `herdr` CLI/socket,
+cross-platform console input). Install it with `python app/install.py`
+(local window machine, plus `--machine <name>` for managed machines). See
+[`app/README.md`](app/README.md) for the TUI↔App mapping and configuration.

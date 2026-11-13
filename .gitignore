@@ -15,3 +15,9 @@ plugins/herdr-quota/.secrets/
 cache.json
 config.json
 node_modules/
+
+# Herdr App generated mod artifacts (rewritten by the app on start)
+app/mods/*/gpui-kit.d.ts
+app/mods/*/herdr.d.ts
+app/mods/*/jsconfig.json
+
