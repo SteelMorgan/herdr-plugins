@@ -79,6 +79,9 @@ KIMI_WEB_BASE_URL = "https://www.kimi.com/apiv2"
 KIMI_WEB_AUTH_URL = "https://auth.kimi.com/api/account.gateway.v1.AuthService/RefreshToken"
 KIMI_WEB_STATS_URL = f"{KIMI_WEB_BASE_URL}/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats"
 KIMI_WEB_TOKEN_PATH = Path(__file__).resolve().parents[1] / ".secrets" / "kimi-web-token.json"
+# Kimi Code CLI device-flow OAuth (public client id, same as the CLI binary).
+KIMI_CODE_OAUTH_URL = "https://auth.kimi.com/api/oauth/token"
+KIMI_CODE_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
 CLAUDE_CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 QWEN_WEB_HOME = "https://home.qwencloud.com"
 QWEN_WEB_USER_INFO_URL = f"{QWEN_WEB_HOME}/tool/user/info.json"
@@ -155,10 +158,18 @@ def find_binary(command: str) -> str | None:
     found = shutil.which(command)
     if found:
         return found
-    candidates = (
+    candidates = [
         Path.home() / ".local" / "bin" / command,
         Path.home() / ".kimi-code" / "bin" / command,
-    )
+    ]
+    if os.name == "nt":
+        # The App core may carry a stale PATH without the npm global prefix;
+        # probe the standard user prefix and the DSH-bundled node prefix.
+        appdata = Path(os.environ.get("APPDATA", ""))
+        local = Path(os.environ.get("LOCALAPPDATA", ""))
+        candidates.append(appdata / "npm" / f"{command}.cmd")
+        candidates.extend(sorted(local.glob(f"GBIG/dsh/node-*/{command}.cmd")))
+        candidates.extend(sorted(local.glob(f"GBIG/dsh/node-*/{command}")))
     return next((str(path) for path in candidates if path.is_file() and os.access(path, os.X_OK)), None)
 
 
@@ -222,9 +233,15 @@ def parse_duration_seconds(text: str) -> int | None:
 
 
 def burn_rate(window: Window) -> float | None:
-    if not window.duration_minutes:
+    duration_minutes = window.duration_minutes
+    if not duration_minutes and window.label == "monthly" and window.resets_at:
+        # Monthly quota without an explicit duration: billing month anchored on
+        # the reset day ([reset - 1 calendar month, reset]), like MiMo.
+        start, end = mimo_billing_window(window.resets_at)
+        duration_minutes = max(1, (end - start) // 60)
+    if not duration_minutes:
         return None
-    duration = window.duration_minutes * 60
+    duration = duration_minutes * 60
     until_reset = max(0, window.resets_at - int(time.time())) if window.resets_at else parse_duration_seconds(window.reset_text)
     if until_reset is None:
         return None
@@ -675,16 +692,86 @@ def parse_kimi_subscription_balance(payload: object) -> Window | None:
     return Window("monthly", used_percent, resets_at=parse_kimi_timestamp(reset_value))
 
 
+def refresh_kimi_code_credentials(path: Path) -> str | None:
+    """Rotate the Kimi Code OAuth pair the same way the CLI does (form POST).
+
+    Keeps every other credential field; writes atomically so a concurrent CLI
+    refresh never sees a half-written file. Returns the new access token.
+    """
+    try:
+        creds = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    refresh = creds.get("refresh_token") if isinstance(creds, dict) else None
+    if not isinstance(refresh, str) or not refresh.strip():
+        return None
+    body = urllib.parse.urlencode({
+        "client_id": KIMI_CODE_CLIENT_ID,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh,
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        KIMI_CODE_OAUTH_URL, data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "User-Agent": "herdr-quota/0.1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            data = json.load(response)
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError, TimeoutError, ValueError):
+        return None
+    access = data.get("access_token") if isinstance(data, dict) else None
+    if not isinstance(access, str) or not access.strip():
+        return None
+    expires_in = parse_quota_int(data.get("expires_in")) or 3600
+    updated = dict(creds)
+    updated.update({
+        "access_token": access,
+        "refresh_token": data.get("refresh_token") or refresh,
+        "expires_in": expires_in,
+        "expires_at": int(time.time()) + expires_in,
+    })
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=".kimi-code.", suffix=".tmp", delete=False
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            json.dump(updated, temporary, indent=2)
+            temporary.write("\n")
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, path)
+    except OSError:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
+    return access
+
+
 def load_kimi_access_token() -> str | None:
-    """Read the existing Kimi Code OAuth token without exposing or persisting it."""
+    """Read the Kimi Code OAuth token, refreshing it when near expiry."""
     for path in KIMI_CREDENTIAL_PATHS:
         try:
             credentials = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        token = credentials.get("access_token") if isinstance(credentials, dict) else None
-        if isinstance(token, str) and token.strip():
-            return token
+        if not isinstance(credentials, dict):
+            continue
+        token = credentials.get("access_token")
+        if not isinstance(token, str) or not token.strip():
+            continue
+        expires_at = parse_quota_int(credentials.get("expires_at"))
+        if expires_at and expires_at - int(time.time()) < 60:
+            refreshed = refresh_kimi_code_credentials(path)
+            if refreshed:
+                return refreshed
+        return token
     return None
 
 
@@ -809,7 +896,40 @@ def kimi_web_monthly_collect() -> Window | None:
     return parse_kimi_subscription_balance(payload)
 
 
-def kimi_monthly_collect(token: str) -> Window | None:
+def parse_kimi_code_usages(payload: object) -> list[Window]:
+    """Map the Kimi Code /usages payload (limits + usages) to shared windows."""
+    windows: list[Window] = []
+    if not isinstance(payload, dict):
+        return windows
+    usages = payload.get("usages") if isinstance(payload.get("usages"), dict) else {}
+    month = usages.get("limit_month_total") or usages.get("limit_month_code")
+    if isinstance(month, dict):
+        percent = parse_ratio_percent(month.get("used_ratio"))
+        if percent is not None:
+            windows.append(Window("monthly", percent, resets_at=iso_epoch(str(month.get("reset_time") or ""))))
+    for group in payload.get("limits") or []:
+        if not isinstance(group, dict):
+            continue
+        detail = group.get("detail") if isinstance(group.get("detail"), dict) else {}
+        spec = group.get("window") if isinstance(group.get("window"), dict) else {}
+        limit = parse_quota_float(detail.get("limit"))
+        used = parse_quota_float(detail.get("used"))
+        duration = parse_quota_int(spec.get("duration"))
+        if limit is None or limit <= 0 or used is None or not duration:
+            continue
+        if not str(spec.get("timeUnit", "")).endswith("MINUTE"):
+            continue
+        label = "5 hour" if duration == 300 else f"{duration}m"
+        windows.append(Window(
+            label,
+            max(0, min(100, round(used * 100 / limit))),
+            resets_at=iso_epoch(str(detail.get("resetTime") or "")),
+            duration_minutes=duration,
+        ))
+    return windows
+
+
+def kimi_code_windows(token: str) -> list[Window]:
     base_url = os.environ.get("KIMI_CODE_BASE_URL", KIMI_CODE_BASE_URL)
     request = urllib.request.Request(
         f"{base_url.rstrip('/')}/usages",
@@ -821,24 +941,30 @@ def kimi_monthly_collect(token: str) -> Window | None:
     )
     try:
         with urllib.request.urlopen(request, timeout=12) as response:
-            return parse_kimi_total_quota(json.load(response))
+            return parse_kimi_code_usages(json.load(response))
     except (urllib.error.HTTPError, urllib.error.URLError, OSError, TimeoutError, ValueError):
-        return None
+        return []
 
 
 def kimi_collect() -> Provider:
     provider = usage_cli_collect("KIMI", "kimi")
     monthly = kimi_web_monthly_collect()
+    code_windows: list[Window] = []
     if monthly is None:
         token = load_kimi_access_token()
-        monthly = kimi_monthly_collect(token) if token else None
-    if monthly is not None:
-        provider.windows = [window for window in provider.windows if window.label != "monthly"]
-        provider.windows.append(monthly)
-        if monthly.used_percent >= 100:
+        if token:
+            code_windows = kimi_code_windows(token)
+            monthly = next((window for window in code_windows if window.label == "monthly"), None)
+    new_windows = ([monthly] if monthly is not None else []) + [w for w in code_windows if w.label != "monthly"]
+    if new_windows:
+        labels = {window.label for window in new_windows}
+        provider.windows = [window for window in provider.windows if window.label not in labels] + new_windows
+        if any(window.used_percent >= 100 for window in new_windows):
             provider.status, provider.error = "depleted", ""
-        elif provider.status in ("empty", "unsupported", "unavailable"):
+        elif provider.status in ("empty", "unsupported", "unavailable", "error"):
             provider.status, provider.error = "ok", ""
+    elif provider.status == "unsupported":
+        provider.error = "Kimi session expired; run kimi login to refresh"
     return provider
 
 
@@ -995,8 +1121,17 @@ def qwen_collect() -> Provider:
     if not binary:
         return Provider("QWEN", status="unconfigured", error="Bailian CLI missing")
     allowed = {"PATH", "HOME", "XDG_CONFIG_HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+               # Windows: bl resolves ~/.bailian via USERPROFILE, not HOME, and
+               # node's CSPRNG needs SystemRoot & co or it aborts at startup.
+               "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
+               "SYSTEMROOT", "windir", "TEMP", "TMP", "PATHEXT", "COMSPEC",
                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"}
     env = {key: value for key, value in os.environ.items() if key in allowed}
+    # bl.cmd needs its own node directory on PATH even if the core's PATH is stale.
+    env["PATH"] = str(Path(binary).parent) + os.pathsep + env.get("PATH", "")
+    # Reusable-artifact call attribution (bailian-protocol).
+    env["BAILIAN_CALLER_TYPE"] = "script"
+    env["BAILIAN_CALLER_NAME"] = "herdr-quota"
     try:
         result = subprocess.run(
             [binary, "usage", "token-plan", "--console-region", "ap-southeast-1",
@@ -1721,6 +1856,20 @@ def truncate(text: str, width: int) -> str:
     return text if len(text) <= width else text[: max(0, width - 1)] + "…"
 
 
+# Providers whose authoritative quota is monthly: pace must follow month-to-date
+# consumption, not the weekly sub-limit. Codex & co stay weekly-first.
+MONTHLY_PACE_PROVIDERS = {"KIMI", "QWEN"}
+
+
+def pace_window_for(provider: Provider) -> Window | None:
+    order = ("monthly", "weekly") if provider.name in MONTHLY_PACE_PROVIDERS else ("weekly", "monthly")
+    for label in order:
+        window = next((window for window in provider.windows if window.label == label), None)
+        if window is not None:
+            return window
+    return None
+
+
 def render(store: Store, refreshing: bool) -> tuple[int, int, int] | None:
     width, height = shutil.get_terminal_size((62, 40))
     width = max(24, width)
@@ -1744,18 +1893,16 @@ def render(store: Store, refreshing: bool) -> tuple[int, int, int] | None:
         state = f"stale {format_age(provider.updated_at)}" if provider.status == "stale" else provider.status
         button = "[⚙]" if provider.name == "DEEPSEEK API" and provider.status == "unconfigured" else ""
         right = state + (f"  {button}" if button else "")
-        pace_window = next(
-            (window for window in provider.windows if window.label == "weekly"),
-            next((window for window in provider.windows if window.label == "monthly"), None),
-        )
+        pace_window = pace_window_for(provider)
         if pace_window:
-            pace = format_burn(pace_window)
+            # Suffix marks the pace basis: m = month-to-date, w = week-to-date.
+            pace = format_burn(pace_window) + ("m" if pace_window.label == "monthly" else "w")
             pace_rate = burn_rate(pace_window)
             pace_color = RED if pace_rate is not None and pace_rate >= 1.5 else (YELLOW if pace_rate is not None and pace_rate > 1 else GREEN)
             pace_padding = max(1, 9 - len(header))
-            left_width = len(header) + pace_padding + 5
+            left_width = len(header) + pace_padding + 6
             gap = max(1, inner - left_width - len(right))
-            lines.append("│ " + BLUE + header + " " * pace_padding + pace_color + f"{pace:<5}" + MUTED + " " * gap + state_color + right + MUTED + " │")
+            lines.append("│ " + BLUE + header + " " * pace_padding + pace_color + f"{pace:<6}" + MUTED + " " * gap + state_color + right + MUTED + " │")
         else:
             gap = max(1, inner - len(header) - len(right))
             lines.append("│ " + BLUE + header + " " * gap + state_color + right + MUTED + " │")
