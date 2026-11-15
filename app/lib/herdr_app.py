@@ -112,7 +112,7 @@ def app_binary() -> str:
 # Command plumbing
 
 
-def _run(command: list[str], timeout: float) -> subprocess.CompletedProcess:
+def _run(command: list[str], timeout: float, env: dict | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         command,
         capture_output=True,
@@ -122,6 +122,7 @@ def _run(command: list[str], timeout: float) -> subprocess.CompletedProcess:
         timeout=timeout,
         check=False,
         creationflags=NO_WINDOW,
+        env=env,
     )
 
 
@@ -143,22 +144,33 @@ def _parse_json(result: subprocess.CompletedProcess, command: list[str]) -> Any:
         raise AppError(f"{' '.join(command[:3])} returned invalid JSON") from exc
 
 
-def hc(*args: str, timeout: float = 20) -> Any:
+def hc(*args: str, timeout: float = 20, env: dict | None = None) -> Any:
     """Run hc with JSON output (``hc ls --json`` etc.)."""
     command = [hc_binary(), *args]
     if "--json" not in args:
         command.append("--json")
-    return _parse_json(_run(command, timeout), command)
+    return _parse_json(_run(command, timeout, env), command)
 
 
-def hc_text(*args: str, timeout: float = 20) -> str:
+def hc_text(*args: str, timeout: float = 20, env: dict | None = None) -> str:
     """Run hc for its text output (``hc read`` prints text)."""
     command = [hc_binary(), *args]
-    result = _run(command, timeout)
+    result = _run(command, timeout, env)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         raise AppError(f"hc {args[0] if args else ''} failed: {detail[:400]}")
     return result.stdout
+
+
+def send_text(address: str, text: str, timeout: float = 90) -> None:
+    """Deliver a chat message cleanly, App-native (no TUI report wrapper).
+
+    The core wraps sends that originate from a terminal (``HC_TERMINAL_ID``)
+    into ``<hc from="...">...</hc>`` child-report tags. Plugin deliveries must
+    read like the user's own typing, so the caller identity is stripped.
+    """
+    env = {k: v for k, v in os.environ.items() if k != "HC_TERMINAL_ID"}
+    hc_text("send", address, text, timeout=timeout, env=env)
 
 
 def app_do(command: str, args: dict[str, Any] | None = None, timeout: float = 20) -> dict:

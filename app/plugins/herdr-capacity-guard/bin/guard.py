@@ -226,7 +226,7 @@ def send_continuation(pane_id: str, expected_kind: str = "codex") -> str:
     allowed = TURN_READY_STATUSES if expected_kind == DSH_TUI_AGENT else READY_STATUSES
     if str(agent.get("agent_status") or "") not in allowed:
         raise RuntimeError(f"agent not ready in {pane_id}: {agent.get('agent_status')}")
-    hc_cli("send", pane_id, RETRY_TEXT, timeout=90)
+    herdr_app.send_text(pane_id, RETRY_TEXT, timeout=90)
     return "hc send"
 
 

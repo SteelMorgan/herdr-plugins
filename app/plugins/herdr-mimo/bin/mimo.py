@@ -102,7 +102,7 @@ def start_here(address: str | None) -> int:
             return open_tui(resolve_cwd(address))
         # The TUI injected the command with `herdr pane run`; typing it into
         # the shell is the App equivalent and keeps the shell alive.
-        herdr_app.hc("send", address, binary, timeout=30)
+        herdr_app.send_text(address, binary, timeout=30)
         print(f"started MiMo in terminal {address}")
         return 0
     return open_tui(os.getcwd())

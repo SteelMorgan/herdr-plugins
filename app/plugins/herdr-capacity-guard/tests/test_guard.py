@@ -98,12 +98,12 @@ class CapacityHandlingTests(unittest.TestCase):
         ):
             with (
                 patch.object(guard, "agent_for_pane", return_value=codex_agent()),
-                patch.object(guard, "hc_cli") as hc_cli,
+                patch.object(guard, "hc_cli"),
+                patch.object(guard.herdr_app, "send_text") as send_text,
             ):
                 guard.handle_capacity_error("t7", guard.CAPACITY_ERROR, guard.CAPACITY_ERROR)
 
-            sends = [c.args for c in hc_cli.call_args_list if c.args[:1] == ("send",)]
-            self.assertEqual(sends, [("send", "t7", "Продолжить")])
+            send_text.assert_called_once_with("t7", "Продолжить", timeout=90)
             self.assertEqual(guard.get_pane_state("t7")["phase"], "awaiting_capacity")
             self.assertEqual(attention_entries(directory), {})
 
@@ -211,19 +211,20 @@ class CapacityHandlingTests(unittest.TestCase):
                 guard.run_scheduled_retry("t7", due)
             send.assert_not_called()
 
-    def test_remote_machine_terminal_uses_native_hc_send(self):
+    def test_remote_machine_terminal_uses_clean_send(self):
         # The TUI needed a Docker mirror route for remote agents; the App
-        # addresses them natively (machine/tN) through the same hc send.
+        # addresses them natively (machine/tN) via the clean send helper
+        # (no <hc from> report wrapper).
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ, {"HERDR_PLUGIN_STATE_DIR": directory}
         ):
             with (
                 patch.object(guard, "agent_for_pane", return_value=codex_agent("done", "dev/t5")),
-                patch.object(guard, "hc_cli") as hc_cli,
+                patch.object(guard.herdr_app, "send_text") as send_text,
             ):
                 delivery = guard.send_continuation("dev/t5")
             self.assertEqual(delivery, "hc send")
-            hc_cli.assert_called_once_with("send", "dev/t5", "Продолжить", timeout=90)
+            send_text.assert_called_once_with("dev/t5", "Продолжить", timeout=90)
 
     def test_send_refuses_a_working_agent(self):
         with patch.object(guard, "agent_for_pane", return_value=codex_agent("working")):
