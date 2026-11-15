@@ -32,11 +32,20 @@ def pump(src, dst):
             pass
 
 
+LOG = __import__('pathlib').Path(__file__).with_name('phone-ssh-bridge.log')
+
+
+def log(msg):
+    with LOG.open('a', encoding='utf-8') as f:
+        f.write(f'{__import__("datetime").datetime.now().isoformat()} {msg}\n')
+
+
 class Handler(socketserver.BaseRequestHandler):
     def handle(self):
+        log(f'accept {self.client_address}')
         p = subprocess.Popen(CMD, stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE,
-                             stderr=subprocess.DEVNULL,
+                             stderr=subprocess.PIPE,
                              creationflags=0x08000000)
         t = threading.Thread(target=pump, args=(p.stdout, self.request), daemon=True)
         t.start()
@@ -56,6 +65,7 @@ class Handler(socketserver.BaseRequestHandler):
                 pass
             p.wait(timeout=10)
             t.join(timeout=5)
+            log(f'closed rc={p.returncode} err={p.stderr.read()[:200]!r}')
             self.request.close()
 
 
