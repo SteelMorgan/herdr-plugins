@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""Read the local Herdr quota snapshot without accessing credentials.
+
+Canonical source: ~/.local/state/llm-usage/snapshot.json (published by the
+central Herdr App quota dashboard). The legacy TUI store is only a fallback
+for machines that predate the central export.
+"""
+import argparse
+import json
+import time
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--json', action='store_true')
+args = parser.parse_args()
+path = Path.home() / '.local/state/llm-usage/snapshot.json'
+if not path.exists():
+    path = Path.home() / '.config/herdr/plugins/config/herdr.quota/usage.json'
+try:
+    data = json.loads(path.read_text(encoding='utf-8'))
+    assert data['schema_version'] == 1
+    now = time.time()
+    age_limit = min(float(data.get('max_age_seconds', 900)), 900)
+    fresh = 0 <= now - data['generated_at'] <= age_limit
+    for provider in data['providers']:
+        windows = provider.get('windows', [])
+        provider['fresh'] = fresh and 0 <= now - provider['updated_at'] <= age_limit
+        provider['usable'] = (provider['fresh'] and provider['status'] == 'ok'
+            and bool(windows) and all(w['remaining_percent'] > 0
+                and (not w.get('resets_at') or w['resets_at'] > now) for w in windows))
+    data['fresh'] = fresh
+except (OSError, ValueError, KeyError, TypeError, AssertionError):
+    data = {'fresh': False, 'providers': [], 'error': 'snapshot missing or invalid'}
+if args.json:
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+else:
+    print('LLM Usage: ' + ('fresh' if data['fresh'] else 'UNKNOWN / STALE'))
+    for p in data['providers']:
+        windows = ', '.join(f"{w['label']}: {w['remaining_percent']:.1f}% remaining" for w in p['windows'])
+        print(f"{p['name']}: {p['status']}; usable={p['usable']}; {windows}")
+raise SystemExit(0 if data['fresh'] else 1)

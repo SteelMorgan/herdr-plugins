@@ -24,7 +24,7 @@ def atomic_json(path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp = tempfile.mkstemp(dir=path.parent, prefix='.usage-')
     try:
-        with os.fdopen(fd, 'w') as output:
+        with os.fdopen(fd, 'w', encoding='utf-8') as output:
             json.dump(payload, output, ensure_ascii=False)
             output.write('\n')
         os.replace(temp, path)
@@ -89,7 +89,7 @@ def _deliver(payload_text, target):
         command = [herdr_app.hc_binary(), 'exec', '-i', '--on', target['machine'],
                    '--timeout', '20'] + command
     return subprocess.run(command, input=payload_text, text=True,
-                          capture_output=True, timeout=30,
+                          encoding='utf-8', capture_output=True, timeout=30,
                           creationflags=herdr_app.NO_WINDOW)
 
 
