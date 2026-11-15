@@ -192,6 +192,7 @@ class CapacityHandlingTests(unittest.TestCase):
                 patch.object(guard, "read_pane_text", return_value=guard.CAPACITY_ERROR),
                 patch.object(guard, "agent_for_pane", return_value=codex_agent()),
                 patch.object(guard, "hc_cli"),
+                patch.object(guard.herdr_app, "send_text"),
             ):
                 guard.run_scheduled_retry("t7", 1000.0)
 
