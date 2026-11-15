@@ -27,6 +27,12 @@
 5. **VM200, запуск агентов**: `/usr/local/sbin/gbig-agent-route` оборачивает
    CLI в `ionice -c2 -n7 nice -n10`; `DISPLAY=:99` + `xvfb.service` (Xvfb :99)
    для буфера обмена (xclip/xsel установлены; на 1c стек уже был).
+5b. **VM200, Radar-батчи**: drop-in `60-resource-cap.conf` на шаблонах
+   `gbig-radar-producer-{collect,conveyor,inbox,extremes}@`,
+   `gbig-radar-{ideas-prepare,informing,prepublication}@`,
+   `gbig-radar-{maintenance,feed-retention}`: CPUWeight=50, IOWeight=50,
+   Nice=10, IOSchedulingClass=idle, MemoryHigh=2G. На `gbig-radar-embed` —
+   те же scheduling/IO-капы БЕЗ MemoryHigh (сохранён 4G, embed держит ~3.2G).
 6. **Windows/core**: `%APPDATA%\herdr-core\config.toml` — `machine_timeout=3`,
    `notes=false` (без `<hc from>`-обвязки и автонот). Плагины: guard скан 30 с /
    300 с при недоступной машине; отправка сообщений без terminal-identity.
@@ -59,14 +65,18 @@ blkio=500, на 200 radar 100M/50M + MemoryHigh 4G, user.slice 16G.
 - VM110: `docker update --cpu-shares 1024 --blkio-weight 0 onec-server`;
 - Windows: убрать строки из config.toml (перезапуск core).
 
-## Known issues / статус на 15.11 16:00
+## Known issues / статус на 15.11 16:35
 
-- VM200 в момент написания заморожена (ожидает восстановления без ребута по
-  решению владельца); по recovery применяются ключ телефона + IO-веса
-  (`io-fix.sh`), затем разбор причины шторма и донастройка.
+- **Причина шторма установлена**: OOM + reclaim. В предыдущей загрузке ядро
+  убило DSH-агента (UID 1001, oom_score_adj 200, journalctl -b -1, 14.11 21:20);
+  Radar-продюсеры (таймеры conveyor/inbox/extremes ~каждые 2 мин) + embed +
+  агенты/сборки исчерпали RAM 20G → kswapd-шторм чтения ~260 МБ/с → ступор
+  sshd/QGA. 15.11 ~16:27 VM200 перезагружена через QMP system_reset (явное
+  согласие владельца); после загрузки ключ телефона добавлен, io.weight=1000
+  применился, капы Radar установлены (п. 5b).
 - На VM200 ранее `io.weight` не появлялся (io-контроллер не включался на
-  slice) — проверять после восстановления; `set-property IOWeight` включает
-  контроллер корректно (подтверждено на VM300).
+  slice); `set-property IOWeight` включает контроллер корректно — после
+  ребута подтверждено (io.weight 1000).
 - VM201 era-dev: IO pressure ~30% от node-сборок — защита применена, при
   повторении смотреть сборки/агентов.
 - VM300 mail: доступ по ключу pve-agent починен владельцем 15.11, защита применена.
