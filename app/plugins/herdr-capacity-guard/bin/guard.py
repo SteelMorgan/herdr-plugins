@@ -61,6 +61,9 @@ RECENT_LINES = 240
 SCAN_INTERVAL_SECONDS = 30
 SCAN_INTERVAL_DEGRADED_SECONDS = 300
 READY_STATUSES = {"idle", "done"}
+# The App core reports DSH turn failures as status "error" (the TUI surfaced
+# them as idle with an error divider). The turn-error recovery must act on it.
+TURN_READY_STATUSES = READY_STATUSES | {"error"}
 
 STOP = threading.Event()
 WATCHING: set[str] = set()
@@ -195,8 +198,17 @@ def kind_label(kind: str) -> str:
 def read_pane_text(pane_id: str) -> str:
     # hc read returns the screen plus history as text; while the agent is
     # working it returns the screen only, and the guard inspects ready agents.
-    text = herdr_app.hc_text("read", pane_id, "--lines", str(RECENT_LINES), timeout=20)
-    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text).replace("\r", "")
+    # The core's machine RPC can time out (3 s) on a loaded host; retry a few
+    # times before giving up so a slow machine does not blind the guard.
+    last: Exception | None = None
+    for _ in range(3):
+        try:
+            text = herdr_app.hc_text("read", pane_id, "--lines", str(RECENT_LINES), timeout=20)
+            return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text).replace("\r", "")
+        except Exception as exc:
+            last = exc
+            time.sleep(2)
+    raise last if last else RuntimeError(f"read failed for {pane_id}")
 
 
 def send_continuation(pane_id: str, expected_kind: str = "codex") -> str:
@@ -211,7 +223,8 @@ def send_continuation(pane_id: str, expected_kind: str = "codex") -> str:
         raise RuntimeError(
             f"Herdr no longer recognizes {kind_label(expected_kind)} in {pane_id}"
         )
-    if str(agent.get("agent_status") or "") not in READY_STATUSES:
+    allowed = TURN_READY_STATUSES if expected_kind == DSH_TUI_AGENT else READY_STATUSES
+    if str(agent.get("agent_status") or "") not in allowed:
         raise RuntimeError(f"agent not ready in {pane_id}: {agent.get('agent_status')}")
     hc_cli("send", pane_id, RETRY_TEXT, timeout=90)
     return "hc send"
@@ -528,7 +541,7 @@ def handle_turn_error(
         agent = agent_for_pane(pane_id)
         if agent is None or agent_kind(agent) != DSH_TUI_AGENT:
             return
-        if str(agent.get("agent_status") or "") not in READY_STATUSES:
+        if str(agent.get("agent_status") or "") not in TURN_READY_STATUSES:
             return
         if not read_text:
             read_text = read_pane_text(pane_id)
@@ -563,7 +576,7 @@ def run_turn_retry(pane_id: str, scheduled_at: float) -> None:
             clear_attention(pane_id, DSH_TUI_AGENT)
             log(f"no live DSH TUI in terminal {pane_id}; canceled turn-error retry")
             return
-        if str(agent.get("agent_status") or "") not in READY_STATUSES:
+        if str(agent.get("agent_status") or "") not in TURN_READY_STATUSES:
             # Preserve the deadline; a working or blocked pane is checked again.
             return
         read_text = read_pane_text(pane_id)
@@ -593,7 +606,7 @@ def inspect_idle_pane(pane_id: str) -> None:
         agent = agent_for_pane(pane_id)
         if agent is None or agent_kind(agent) != DSH_TUI_AGENT:
             return
-        if str(agent.get("agent_status") or "") not in READY_STATUSES:
+        if str(agent.get("agent_status") or "") not in TURN_READY_STATUSES:
             return
         text = read_pane_text(pane_id)
         if has_recent_turn_error(text):
@@ -764,7 +777,7 @@ def retry_scheduler() -> None:
         if time.monotonic() >= next_scan:
             try:
                 for agent in agents_snapshot():
-                    if agent_is_watched(agent) and agent.get("agent_status") in READY_STATUSES:
+                    if agent_is_watched(agent) and agent.get("agent_status") in TURN_READY_STATUSES:
                         inspect_idle_pane(str(agent.get("pane_id") or ""))
             except Exception as exc:
                 log(f"could not scan idle agent terminals: {exc}")
@@ -784,7 +797,7 @@ def start_retry_scheduler() -> None:
 
 
 def process_agent_status(pane_id: str, status: str) -> None:
-    if status in READY_STATUSES:
+    if status in TURN_READY_STATUSES:
         inspect_idle_pane(pane_id)
 
 

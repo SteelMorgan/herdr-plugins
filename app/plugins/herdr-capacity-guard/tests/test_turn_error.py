@@ -116,6 +116,32 @@ class TurnErrorHandlingTests(unittest.TestCase):
         self.assertEqual(state["phase"], "turn_cooldown")
         self.assertEqual(state["retry_at"], 1000.0 + guard.RETRY_DELAY_SECONDS)
 
+    def test_app_error_status_sends_continue(self):
+        # The App core reports DSH turn failures as status "error" (TUI: idle).
+        calls = []
+
+        def fake_send(pane_id, expected_kind="codex"):
+            calls.append((pane_id, expected_kind))
+            return "hc send"
+
+        with (
+            patch.object(guard, "agent_for_pane", return_value=dsh_agent("error")),
+            patch.object(guard.time, "time", return_value=1000.0),
+            patch.object(guard, "send_continuation", side_effect=fake_send),
+            patch.object(guard, "hc_cli"),
+        ):
+            guard.handle_turn_error("dev/t3", "turn error", turn_tail())
+
+        self.assertEqual(calls, [("dev/t3", "dsh-tui")])
+        self.assertEqual(guard.get_pane_state("dev/t3")["phase"], "turn_cooldown")
+
+    def test_quota_429_turn_error_is_recognized(self):
+        text = turn_tail().replace(
+            "The engine is currently overloaded, please try again later",
+            '429: {"message":"Allocated quota exceeded, please increase your quota limit."}',
+        )
+        self.assertIsNotNone(guard.recent_turn_error(text))
+
     def test_kimi_api_error_sends_continue_and_starts_cooldown(self):
         calls = []
 
