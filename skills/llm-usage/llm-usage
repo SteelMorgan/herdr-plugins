@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Read the local Herdr quota snapshot without accessing credentials.
 
-Canonical source: ~/.local/state/llm-usage/snapshot.json (published by the
-central Herdr App quota dashboard). The legacy TUI store is only a fallback
-for machines that predate the central export.
+Single source of truth: ~/.local/state/llm-usage/snapshot.json, published by
+the central Herdr App quota dashboard. No legacy fallbacks.
 """
 import argparse
 import json
@@ -14,8 +13,6 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--json', action='store_true')
 args = parser.parse_args()
 path = Path.home() / '.local/state/llm-usage/snapshot.json'
-if not path.exists():
-    path = Path.home() / '.config/herdr/plugins/config/herdr.quota/usage.json'
 try:
     data = json.loads(path.read_text(encoding='utf-8'))
     assert data['schema_version'] == 1
