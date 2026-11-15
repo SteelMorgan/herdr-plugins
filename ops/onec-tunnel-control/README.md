@@ -35,6 +35,18 @@ Watchdog был жив и вызывал guard, но вердикт `healthy_or_
 - все прежние защиты сохранены: 3 подтверждения / 40 с, cooldown 120 с,
   pidfd-identity recheck перед SIGTERM.
 
+## Автономность на VM110 (2026-11-16)
+
+WSL-watchdog вызывает guard по SSH; при флапах WG этот SSH падает
+(`inspection_unavailable_no_action`) и орфаны не прибираются. Добавлено:
+- `gbig-tunnel-guard-local.timer` на VM110 — каждые 30 с локальный
+  `onec-ssh-tunnel-guard check --container-started <now-10min>` (wrapper
+  `/usr/local/sbin/gbig-tunnel-guard-local`). Критерии безопасности те же;
+  здоровая сессия не простаивает 180 с (keepalive), поэтому не страдает.
+- scoped keepalive для onec-v8sm-tunnel поднят до 30×6 (180 с) — короткие
+  флапы WG больше не убивают живую сессию туннеля (раньше 15×3=45 с,
+  отсюда цикл рестартов контейнера в окна нестабильности).
+
 ## Проверка
 
 - Тесты: `python3 -m unittest test_guard_stale` (7/7 на VM110, 2026-11-15).
