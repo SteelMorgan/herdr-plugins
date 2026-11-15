@@ -56,6 +56,14 @@
 - **VM201 16G**: used ~11.8G, avail ~4.2G; база k3s 2.3G + java/redpanda/
   containerd/node/minio ≈ 2G; swap не было — добавлен zram0 4G + swappiness 100
   + user.slice io.max 100M/50M (тем же `swap-trim.sh`).
+- **VM110 16G (1С+Postgres, продакшен)**: давления нет (avail ~12G, postgres
+  в page cache), но swap не было — добавлен zram0 4G как страховка от пиков
+  (регламенты/work_mem). **swappiness=10** (консервативно: горячие анонимные
+  страницы БД остаются в RAM), без io-капов — продакшен не дросселируем.
+  Скрипт: `ops/scripts/swap-trim-db.sh`. Нюанс: после ручной установки
+  `systemctl start dev-zram0.swap` (генератор создаёт юнит, но среди сессии
+  swap-юнит надо активировать); при загрузке подхватывается через
+  `swap.target.wants` (проверено на 110/200/201).
 
 ## Проверка (по хостам)
 
