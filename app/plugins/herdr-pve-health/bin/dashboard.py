@@ -85,11 +85,23 @@ def due(groups,now):
 def ssh(target,script,args=()):
     command='sudo -n python3 -'+''.join(' '+shlex.quote(a) for a in args)
     start=time.monotonic()
-    p=subprocess.run(['ssh','-F',str(SSH_CONFIG),'-o','ConnectTimeout=5',
-                      '-o','BatchMode=yes',target,command],input=script,
-                     text=True,capture_output=True,timeout=45)
-    if p.returncode:raise RuntimeError(f'SSH {target}: exit={p.returncode} '+p.stderr.strip()[:120])
-    return json.loads(p.stdout),(time.monotonic()-start)*1000
+    # Popen + tree-kill: on Windows a timed-out ssh leaves its ProxyCommand
+    # child holding the pipes, which hangs subprocess.run() forever and
+    # freezes the whole poll loop (incident 2026-11-15, VM200 freeze).
+    p=subprocess.Popen(['ssh','-F',str(SSH_CONFIG),'-o','ConnectTimeout=5',
+                        '-o','BatchMode=yes',target,command],
+                       stdin=subprocess.PIPE,stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE,text=True,
+                       creationflags=herdr_app.NO_WINDOW)
+    try:
+        out,err=p.communicate(input=script,timeout=45)
+    except subprocess.TimeoutExpired:
+        subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'],
+                       capture_output=True,creationflags=herdr_app.NO_WINDOW)
+        out,err=p.communicate()
+        raise RuntimeError(f'SSH {target}: timeout after 45s (process tree killed)')
+    if p.returncode:raise RuntimeError(f'SSH {target}: exit={p.returncode} '+err.strip()[:120])
+    return json.loads(out),(time.monotonic()-start)*1000
 
 
 def metrics(current,previous):
