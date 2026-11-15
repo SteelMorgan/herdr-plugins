@@ -45,7 +45,7 @@ def docker(*args):
 
 
 def inspect(name):
-    template = '{"id":{{json .Id}},"state":{{json .State.Status}},"started":{{json .State.StartedAt}},"network":{{json .HostConfig.NetworkMode}}}'
+    template = '{"id":{{json .Id}},"state":{{json .State.Status}},"started":{{json .State.StartedAt}},"network":{{json .HostConfig.NetworkMode}},"restart":{{json .HostConfig.RestartPolicy.Name}}}'
     result = docker('inspect', '--format', template, name)
     return json.loads(result.stdout) if result.returncode == 0 else None
 
@@ -101,6 +101,10 @@ def check():
         return state('running', parent_id=parent['id'], tunnel_id=target['id'], ssh_guard=guard)
     if target['state'] not in ('exited', 'created'):
         return state('waiting_for_tunnel', tunnel_state=target['state'], ssh_guard=guard)
+    if target.get('restart') == 'no':
+        # Operator deliberately stopped the sidecar (docker stop --restart=no).
+        # Never override an explicit stop; the WS channel may not need it.
+        return state('stopped_by_operator', ssh_guard=guard)
     result = docker('start', TUNNEL)
     if result.returncode:
         return state('start_failed', message=result.stderr.strip()[-400:])
