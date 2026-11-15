@@ -627,7 +627,7 @@ def render(daemon: bool, hosts: list[Host], width: int, now: float) -> str:
         if host.error:
             lines.append(f"{BG}{PANEL}{RED}  {fit(host.error, inner)}  {RESET}")
     lines.append(f"{BG}{TEXT}{fit('', width)}")
-    footer = "  r refresh q close" if compact else "  r refresh · q close · auto 3s"
+    footer = "  r refresh q close" if compact else f"  r refresh · q close · auto {300 if MACHINES_DOWN else 30}s"
     lines.append(f"{BG}{MUTED}{fit(footer, width)}{RESET}")
     return f"{ESC}H" + "\n".join(lines) + f"{ESC}J"
 

@@ -354,6 +354,79 @@ def run_plugin_terminal(
     return str(address)
 
 
+# Remembered dashboard arrangement (owner's layout, 2026-11-15):
+# top row = resources | quota, bottom full-width = pve-health.
+# Overridable via <config>/herdr.dashboards/layout.json {"steps": [...]}.
+DASHBOARD_LAYOUT = [
+    {"plugin": "herdr.resources", "op": "first"},
+    {"plugin": "herdr.pve-health", "op": "split", "direction": "down", "of": "herdr.resources"},
+    {"plugin": "herdr.quota", "op": "split", "direction": "right", "of": "herdr.resources"},
+]
+
+
+def dashboard_layout() -> list[dict]:
+    path = config_dir("herdr.dashboards") / "layout.json"
+    try:
+        steps = json.loads(path.read_text(encoding="utf-8")).get("steps")
+        if isinstance(steps, list) and steps:
+            return steps
+    except (OSError, ValueError):
+        pass
+    return DASHBOARD_LAYOUT
+
+
+def create_placed_terminal(
+    plugin_id: str,
+    argv: list[str],
+    name: str,
+    cwd: str | None = None,
+    machine: str | None = None,
+    space_name: str = DEFAULT_SPACE_NAME,
+) -> str:
+    """Create a dashboard terminal in its remembered slot when possible.
+
+    The recipe splits an existing anchor pane (pane.split carries argv), then
+    labels the new terminal so open-or-focus and the restorer keep working.
+    Falls back to plain adoption when the anchor or the recipe is absent.
+    """
+    step = next((s for s in dashboard_layout() if s.get("plugin") == plugin_id), None)
+    if step and step.get("op") == "split":
+        anchor = plugin_terminal(str(step.get("of") or ""))
+        location = terminal_location(str(anchor["address"])) if anchor else None
+        if location and location.get("pane"):
+            space = find_space(space_name, machine)
+            before = {
+                t.get("terminal")
+                for tab in (space or {}).get("tabs", [])
+                for t in tab.get("terminals", [])
+            }
+            try:
+                app_do("pane.split", {
+                    "direction": step.get("direction", "right"),
+                    "pane": location["pane"],
+                    "argv": argv,
+                })
+                fresh = app_ls()
+                new = next((
+                    t.get("terminal")
+                    for s in fresh.get("spaces", [])
+                    for tab in s.get("tabs", [])
+                    for t in tab.get("terminals", [])
+                    if t.get("terminal") not in before and t.get("terminal")
+                ), None)
+                if new:
+                    hc(
+                        "label", str(new),
+                        f"{PLUGIN_LABEL}={plugin_id}",
+                        f"{SPACE_LABEL}={local_id(location['space'])}",
+                        f"{TAB_LABEL}={local_id(location['tab'])}",
+                    )
+                    return str(new)
+            except AppError:
+                pass
+    return run_plugin_terminal(plugin_id, argv, name, cwd, machine, space_name)
+
+
 def open_plugin_pane(
     plugin_id: str,
     argv: list[str],
@@ -370,7 +443,7 @@ def open_plugin_pane(
         if focus:
             focus_terminal(address)
         return address
-    address = run_plugin_terminal(plugin_id, argv, name, cwd, machine, space_name)
+    address = create_placed_terminal(plugin_id, argv, name, cwd, machine, space_name)
     if focus:
         # Adoption is asynchronous; give the window a moment to place it.
         deadline = time.monotonic() + 5

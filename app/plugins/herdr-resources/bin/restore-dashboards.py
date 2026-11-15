@@ -81,7 +81,7 @@ def restore_once() -> bool:
             continue
         argv = [herdr_app.python_executable(), dashboard]
         try:
-            address = herdr_app.run_plugin_terminal(
+            address = herdr_app.create_placed_terminal(
                 plugin,
                 argv,
                 name=directory,
