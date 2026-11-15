@@ -266,6 +266,9 @@ def _legacy_mirror_state() -> tuple[bool, dict[str, bool]]:
     return daemon, linked
 
 
+MACHINES_DOWN = False
+
+
 def mirror_state() -> tuple[bool, dict[str, bool]]:
     """Fleet liveness. App: the core and its managed machines (hc machine ls).
 
@@ -273,20 +276,25 @@ def mirror_state() -> tuple[bool, dict[str, bool]]:
     status produced, so the collectors and renderer stay unchanged. The
     legacy herdr-mirror daemon remains a fallback for mixed setups.
     """
+    global MACHINES_DOWN
     try:
         machines = herdr_app.hc("machine", "ls", timeout=10).get("machines", [])
     except Exception:
+        MACHINES_DOWN = True
         return _legacy_mirror_state()
     linked: dict[str, bool] = {}
+    down = False
     for machine in machines:
         if machine.get("temporary"):
             continue
         connected = machine.get("state") == "connected"
+        down = down or not connected
         # Index by machine name and by host so fleet entries can match either
         # (hosts.toml keys, container names, ssh targets).
         for key in (machine.get("name"), machine.get("host")):
             if key:
                 linked[str(key)] = connected
+    MACHINES_DOWN = down
     return True, linked
 
 
@@ -654,7 +662,10 @@ def main() -> int:
             while True:
                 width = shutil.get_terminal_size((60, 30)).columns
                 print(render(daemon, hosts, width, refreshed), end="", flush=True)
-                if console.wait(max(0.1, 3 - (time.time() - refreshed))):
+                # 30s normally, 300s while any managed machine is down: core
+                # machine probes serialize and can stall the App UI.
+                interval = 300 if MACHINES_DOWN else 30
+                if console.wait(max(0.1, interval - (time.time() - refreshed))):
                     key, _ = console.read()
                     if key in ("q", "Q", "\x03"):
                         break

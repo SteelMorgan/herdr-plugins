@@ -58,7 +58,8 @@ PANE_STATES_FILE = "pane-states.json"
 ATTENTION_FILE = "attention.json"
 RECENT_MESSAGES = 8
 RECENT_LINES = 240
-SCAN_INTERVAL_SECONDS = 5
+SCAN_INTERVAL_SECONDS = 30
+SCAN_INTERVAL_DEGRADED_SECONDS = 300
 READY_STATUSES = {"idle", "done"}
 
 STOP = threading.Event()
@@ -87,6 +88,29 @@ def log(message: str) -> None:
 
 def hc_cli(*args: str, timeout: float = 15) -> Any:
     return herdr_app.hc(*args, timeout=timeout)
+
+
+def scan_interval(machines: list[dict[str, Any]]) -> int:
+    """30s when every managed machine is connected, 300s otherwise.
+
+    Keeps core request pressure low in normal operation and backs off hard
+    while a machine is unreachable (its SSH probes serialize in the core and
+    can stall the App UI).
+    """
+    for machine in machines:
+        if machine.get("temporary"):
+            continue
+        if machine.get("state") != "connected":
+            return SCAN_INTERVAL_DEGRADED_SECONDS
+    return SCAN_INTERVAL_SECONDS
+
+
+def any_machine_down() -> bool:
+    try:
+        machines = hc_cli("machine", "ls", timeout=5).get("machines", [])
+    except Exception:
+        return True
+    return scan_interval(machines) == SCAN_INTERVAL_DEGRADED_SECONDS
 
 
 def agents_snapshot() -> list[dict[str, Any]]:
@@ -744,7 +768,9 @@ def retry_scheduler() -> None:
                         inspect_idle_pane(str(agent.get("pane_id") or ""))
             except Exception as exc:
                 log(f"could not scan idle agent terminals: {exc}")
-            next_scan = time.monotonic() + SCAN_INTERVAL_SECONDS
+            next_scan = time.monotonic() + (
+                SCAN_INTERVAL_DEGRADED_SECONDS if any_machine_down() else SCAN_INTERVAL_SECONDS
+            )
         if STOP.wait(1):
             return
 
