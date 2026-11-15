@@ -27,6 +27,13 @@
 5. **VM200, запуск агентов**: `/usr/local/sbin/gbig-agent-route` оборачивает
    CLI в `ionice -c2 -n7 nice -n10`; `DISPLAY=:99` + `xvfb.service` (Xvfb :99)
    для буфера обмена (xclip/xsel установлены; на 1c стек уже был).
+5c. **VM200, swap/zram**: swap отсутствовал вовсе — шторм был refault-чтением
+   файлового кэша. Добавлен zram0 (4G, zstd, priority 100,
+   `systemd-zram-generator`, `/etc/systemd/zram-generator.conf`),
+   `vm.swappiness=100` (`/etc/sysctl.d/90-gbig-swap.conf`) — давление памяти
+   уходит в сжатую RAM, а не на диск. `user.slice` получил жёсткий
+   `io.max` 100M read / 50M write (любой дисковый IO тяжёлых cgroup, включая
+   возможный будущий disk-swap, подрезан). Скрипт: `ops/scripts/swap-trim.sh`.
 5b. **VM200, Radar-батчи**: drop-in `60-resource-cap.conf` на шаблонах
    `gbig-radar-producer-{collect,conveyor,inbox,extremes}@`,
    `gbig-radar-{ideas-prepare,informing,prepublication}@`,
