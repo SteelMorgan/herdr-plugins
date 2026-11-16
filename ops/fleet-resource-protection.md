@@ -125,3 +125,31 @@ blkio=500, на 200 radar 100M/50M + MemoryHigh 4G, user.slice 16G.
 - VM201 era-dev: IO pressure ~30% от node-сборок — защита применена, при
   повторении смотреть сборки/агентов.
 - VM300 mail: доступ по ключу pve-agent починен владельцем 15.11, защита применена.
+
+## Диск VM200: карта и очистка 16.11
+
+Инструмент: `ops/scripts/disk-map.py` (на VM200 `~/.local/bin/disk-map`,
+запуск `sudo disk-map`): полная карта с ionice idle/nice 19, JSON+TXT в
+`~/.local/state/disk-map/`, повторный запуск даёт diff с предыдущим.
+Ничего не удаляет.
+
+Карта 16.11: 120G/148G (85%). Рост дали билд-каталоги агентов от 15.11
+(~26G) и radar.db (330M→2.8G). По явному согласию владельца удалено:
+- 8 путей завершённых билдов 15.11 (6 в /home/hermes: b6-delta-wHQFQ9cn,
+  hr-reader/identity-build, hr-replay-merge/build/fix; /var/tmp/ram-relief-20261115
+  целиком; /tmp/b6-build-LI2S6VPx). Проверено: .git внутри нет, процессов
+  с cwd/open files нет, образы этих билдов уже в podman;
+- dangling-образы podman (`podman image prune -f`, ~400 записей включая
+  промежуточные слои); тегированные ревизии билдов владелец оставил;
+- 378 каталогов /root/gbig-* (21.7G, установочные/квалификационные остатки
+  30.10–06.11, ссылок из systemd/cron/live-кода ноль).
+
+Сохранено: pinned recovery-образы gbig-local-speech 640e31e8f88c и
+gbig-local-media 8c1e2ad0fa9e (сверены с IMAGE-LOCK), базы/registry-образы,
+worktrees, hermes/work, CLI, .hermes, Office-образы, живые данные Radar
+(/var/lib/gbig-radar, /opt/gbig-radar) — зона Radar не тронута.
+
+Итог: 68G/148G (48%), свободно 74G; /tmp 2.9G→298M. Освобождено ~52GiB.
+Паттерн повторяется: агенты строят в /tmp и оставляют source.tar+tasks
+после завершения — при росте диска сначала смотреть свежие билд-каталоги
+и dangling podman.
